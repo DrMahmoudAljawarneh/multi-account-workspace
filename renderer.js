@@ -66,11 +66,15 @@ function mountWebview(appObj) {
     if (!appObj.wv) {
         showToast(`Starting ${appObj.app.name}...`, '🚀');
         const wv = document.createElement('webview');
-        wv.src = appObj.app.url;
-        wv.partition = `persist:${appObj.profileName}`;
+        // Partition must be set before src (first navigation locks the session)
+        wv.setAttribute('partition', `persist:${appObj.profileName}`);
+        wv.setAttribute('allowpopups', ''); // required for "Sign in with Google" popups
+        // 100% Solution: We must also override the DOM UA, otherwise navigator.userAgent 
+        // exposes "Electron" to Google's JavaScript engine inside the webview!
+        wv.setAttribute('useragent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0');
         wv.style.display = 'none';
-        wv.useragent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
         window.api.setupPartition(wv.partition);
+        wv.setAttribute('src', appObj.app.url);
         
         wv.addEventListener('dom-ready', () => {
             if (appObj.app.customCSS) wv.insertCSS(appObj.app.customCSS);

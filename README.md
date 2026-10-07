@@ -1,6 +1,6 @@
-# Workspace - Multi-Account Isolated Web Workspace
+# WebSpace - Multi-Account Isolated WebSpace
 
-**Workspace** is a modern, production-grade desktop application built with **Electron** that organizes and isolates multiple web services, accounts, and communication tools (WhatsApp, Teams, Overleaf, Facebook, Gmail, etc.) into distinct profiles with hardware-sandboxed cookie and session storage.
+**WebSpace** is a modern, production-grade desktop application built with **Electron** that organizes and isolates multiple web services, accounts, and communication tools (WhatsApp, Teams, Overleaf, Facebook, Gmail, etc.) into distinct profiles with hardware-sandboxed cookie and session storage.
 
 Designed for productivity on modern **Linux (Ubuntu, Asahi Linux, Wayland)** and **Windows 11**.
 
@@ -29,6 +29,7 @@ Designed for productivity on modern **Linux (Ubuntu, Asahi Linux, Wayland)** and
 - **Secure Architecture:** Complete context isolation (`contextIsolation: true`, `nodeIntegration: false`) with a typed `preload.js` bridge.
 - **Hardware Permission Dialogs:** Prompts before granting camera, microphone, or location access to web views.
 - **Smart External Link Router:** Links clicked inside web apps (e.g., Zoom links in emails) automatically open in your default system browser (Firefox/Chrome) rather than trapping you inside the app window.
+- **Ultimate Botguard Bypass:** Natively spoofs Firefox 157.0 across network headers and the DOM (destroying Chromium client hints and `userAgentData`) to guarantee 100% successful Google Account sign-ins without "This browser is not secure" errors.
 
 ### ⚙️ Power-User Customization
 - **In-App Settings UI:** Edit and reload your `config.json` directly from the toolbar (`⚙️ Settings`).
@@ -72,8 +73,8 @@ Generates native Debian/Ubuntu packages and standalone AppImages:
 npm run build
 ```
 Outputs in `dist/`:
-- `dist/Workspace-1.0.0.AppImage`
-- `dist/multi-account-workspace_1.0.0_amd64.deb`
+- `dist/WebSpace-1.0.4.AppImage`
+- `dist/webspace_1.0.4_amd64.deb`
 
 ### 2. Build for Windows 11 (.exe)
 Generates an NSIS setup executable:
@@ -81,7 +82,7 @@ Generates an NSIS setup executable:
 npm run build:win
 ```
 Outputs in `dist/`:
-- `dist/Workspace Setup 1.0.0.exe`
+- `dist/WebSpace Setup 1.0.4.exe`
 
 *(Note: Building Windows binaries locally from Linux requires Wine. Alternatively, use GitHub Actions below).*
 

@@ -1,12 +1,12 @@
 {
-  "name": "multi-account-workspace",
-  "version": "1.0.0",
+  "name": "webspace",
+  "version": "1.0.4",
   "description": "A secure, multi-account web workspace.",
   "author": {
     "name": "DrMJ",
     "email": "drmj@local.dev"
   },
-  "homepage": "https://github.com/drmj/multi-account-workspace",
+  "homepage": "https://github.com/drmj/webspace",
   "main": "main.js",
   "scripts": {
     "start": "electron . --no-sandbox --disable-gpu",
@@ -14,8 +14,8 @@
     "build:win": "electron-builder --win nsis"
   },
   "build": {
-    "appId": "com.drmj.multiworkspace",
-    "productName": "Workspace",
+    "appId": "com.drmj.webspace",
+    "productName": "WebSpace",
     "publish": {
       "provider": "github",
       "releaseType": "draft"
@@ -45,7 +45,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^44.6.0",
+    "electron": "^44.7.0",
     "electron-builder": "^26.15.3"
   }
 }
