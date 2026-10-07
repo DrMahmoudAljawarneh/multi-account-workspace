@@ -1,0 +1,47 @@
+{
+  "name": "multi-account-workspace",
+  "version": "1.0.0",
+  "description": "A secure, multi-account web workspace.",
+  "author": {
+    "name": "DrMJ",
+    "email": "drmj@local.dev"
+  },
+  "homepage": "https://github.com/drmj/multi-account-workspace",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron . --no-sandbox --disable-gpu",
+    "build": "electron-builder --linux",
+    "build:win": "electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.drmj.multiworkspace",
+    "productName": "Workspace",
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Network"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.6.0",
+    "electron-builder": "^26.15.3"
+  }
+}
