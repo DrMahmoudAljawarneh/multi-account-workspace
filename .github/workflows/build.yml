@@ -7,6 +7,9 @@ on:
       - 'v*'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -30,10 +33,14 @@ jobs:
 
       - name: Build Linux Installers (.AppImage & .deb)
         if: matrix.os == 'ubuntu-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build
 
       - name: Build Windows 11 Installer (.exe)
         if: matrix.os == 'windows-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build:win
 
       - name: Upload Artifacts

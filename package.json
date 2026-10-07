@@ -16,6 +16,10 @@
   "build": {
     "appId": "com.drmj.multiworkspace",
     "productName": "Workspace",
+    "publish": {
+      "provider": "github",
+      "releaseType": "draft"
+    },
     "linux": {
       "target": [
         "AppImage",
