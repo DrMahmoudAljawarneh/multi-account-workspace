@@ -22,6 +22,10 @@ contextBridge.exposeInMainWorld('api', {
     saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
     writeClipboard: (text) => ipcRenderer.invoke('clipboard-write', text),
 
+    // Session state (active app, split, zoom/mute/urls) — stored next to config.json
+    getSession: () => ipcRenderer.invoke('get-session'),
+    saveSession: (data) => ipcRenderer.send('save-session', data),
+
     // Credential Vault
     saveCredential: (data) => ipcRenderer.invoke('save-credential', data),
     getCredential: (appName) => ipcRenderer.invoke('get-credential', appName),

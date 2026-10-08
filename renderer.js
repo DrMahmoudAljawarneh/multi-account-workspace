@@ -132,6 +132,7 @@ function setPane(pane) {
     document.getElementById('left-pane').classList.toggle('active-pane', pane === 'left');
     document.getElementById('right-pane').classList.toggle('active-pane', pane === 'right');
     updateNavState();
+    persistSession(true);
 }
 document.getElementById('left-pane').addEventListener('mousedown', () => setPane('left'));
 document.getElementById('right-pane').addEventListener('mousedown', () => setPane('right'));
@@ -212,6 +213,23 @@ function mountWebview(appObj, targetStack) {
         wv.addEventListener('dom-ready', async () => {
             if (appObj.app.customCSS) wv.insertCSS(appObj.app.customCSS);
 
+            // Re-apply remembered per-app state (survives hibernation & navigation)
+            try { wv.setZoomFactor(appObj.zoom || 1); } catch (e) {}
+            try { wv.setAudioMuted(!!appObj.muted); } catch (e) {}
+
+            // Restore the last visited URL for this app — consumed once, so the
+            // fresh dom-ready after loadURL skips this block entirely
+            if (appObj.pendingUrl) {
+                const target = appObj.pendingUrl;
+                appObj.pendingUrl = null;
+                let cur = null;
+                try { cur = wv.getURL(); } catch (e) {}
+                if (cur !== target) {
+                    try { wv.loadURL(target); } catch (e) {}
+                    return; // injection runs on the restored page instead
+                }
+            }
+
             // Auto-Login Script Injection (values JSON-stringified to survive quotes)
             if (window.api.getCredential) {
                 try {
@@ -259,11 +277,24 @@ function mountWebview(appObj, targetStack) {
             if (isVisible(wv)) endProgress();
             updateNavState();
         });
-        wv.addEventListener('did-navigate', () => {
+        wv.addEventListener('did-navigate', (e) => {
             appObj.item.classList.remove('error');
+            if (e && e.url) appObj.lastUrl = e.url;
             updateNavState();
+            persistSession(false); // debounced — navigation storms shouldn't thrash disk
         });
-        wv.addEventListener('did-navigate-in-page', updateNavState);
+        wv.addEventListener('did-navigate-in-page', (e) => {
+            if (e && e.url) appObj.lastUrl = e.url;
+            updateNavState();
+            persistSession(false);
+        });
+        wv.addEventListener('found-in-page', (e) => {
+            // Payload is wrapped in e.result per the Electron 44 typings; the
+            // flattened fallback keeps it working if a build spreads it instead
+            const r = e.result || (typeof e.matches === 'number' ? e : null);
+            if (!r || wv !== findBarWv) return;
+            findCount.textContent = r.matches > 0 ? `${r.activeMatchOrdinal} / ${r.matches}` : '0 / 0';
+        });
         wv.addEventListener('did-fail-load', (e) => {
             if (!e.isMainFrame || e.errorCode === -3) return; // ignore aborted loads & subframes
             markLoadError(appObj, e.errorDescription || `error ${e.errorCode}`);
@@ -291,9 +322,20 @@ function activateApp(appObj) {
         el.style.display = el === wv ? 'flex' : 'none';
     });
 
+    // Re-assert this app's remembered zoom/mute every time it becomes active
+    // (Chromium's per-origin zoom can be clobbered by another guest)
+    try { wv.setZoomFactor(appObj.zoom || 1); } catch (e) {}
+    try { wv.setAudioMuted(!!appObj.muted); } catch (e) {}
+
     syncActiveStates();
     beginFakeProgress();
     updateNavState();
+
+    // Session: app switch is an immediate save; an open find bar restarts on the new app
+    persistSession(true);
+    if (findBar.classList.contains('show') && findInput.value.trim()) {
+        runFind(findInput.value.trim(), true, true);
+    }
 }
 
 function getActiveWebview() {
@@ -307,7 +349,114 @@ function updateNavState() {
     try { if (wv) { back = wv.canGoBack(); fwd = wv.canGoForward(); } } catch (e) {}
     document.getElementById('btn-back').classList.toggle('disabled', !back);
     document.getElementById('btn-forward').classList.toggle('disabled', !fwd);
+    updateMuteButton();
 }
+
+// ---------- Session state (restored across restarts) ----------
+// Persisted to session.json NEXT TO config.json (same path resolution).
+// NEVER stored in settings.json — that file is shared with the Flutter build.
+// Schema:
+//   { activeApp, activePane, sidebarCollapsed, splitView, splitApp,
+//     zoom: { "profile::app": factor }, muted: { "profile::app": true },
+//     urls: { "profile::app": lastUrl } }
+
+let sessionReady = false;
+let sessionSaveTimer = null;
+
+// App names are only unique within a profile ("Calendar" exists twice), so
+// every session key is prefixed with its profile name.
+function appKey(o) {
+    return o ? `${o.profileName}::${o.app.name}` : null;
+}
+function findAppByKey(key) {
+    return key ? (webviews.find(o => appKey(o) === key) || null) : null;
+}
+function appObjForWv(wv) {
+    return wv ? (webviews.find(o => o.wv === wv) || null) : null;
+}
+function activeAppObj() {
+    return appObjForWv(getActiveWebview()) || activeApp;
+}
+
+function buildSessionState() {
+    const st = {
+        activeApp: appKey(activeAppObj()),
+        activePane: activePane,
+        sidebarCollapsed: sidebar.classList.contains('collapsed'),
+        splitView: isSplit,
+        splitApp: null,
+        zoom: {},
+        muted: {},
+        urls: {}
+    };
+    if (isSplit) {
+        const rw = Array.from(rightStack.children).find(el => el.tagName === 'WEBVIEW' && el.style.display === 'flex');
+        st.splitApp = appKey(appObjForWv(rw));
+    }
+    webviews.forEach(o => {
+        const k = appKey(o);
+        if (!k) return;
+        if (typeof o.zoom === 'number' && o.zoom !== 1) st.zoom[k] = o.zoom;
+        if (o.muted) st.muted[k] = true;
+        let url = o.lastUrl || o.pendingUrl || null;
+        if (!url && o.wv) { try { url = o.wv.getURL(); } catch (e) {} }
+        if (url && url !== o.app.url) st.urls[k] = url;
+    });
+    return st;
+}
+
+// immediate = true for discrete actions (switch / zoom / mute / sidebar / split),
+// debounced for high-frequency navigation events
+function persistSession(immediate) {
+    if (!sessionReady || !window.api.saveSession) return;
+    if (sessionSaveTimer) { clearTimeout(sessionSaveTimer); sessionSaveTimer = null; }
+    const write = () => {
+        sessionSaveTimer = null;
+        try { window.api.saveSession(buildSessionState()); } catch (e) {}
+    };
+    if (immediate) write();
+    else sessionSaveTimer = setTimeout(write, 800);
+}
+
+// Boot restore — stamps per-app state onto the appObjs (applied when guests mount)
+function applySessionToApps(st) {
+    if (!st) return;
+    webviews.forEach(o => {
+        const k = appKey(o);
+        if (st.zoom && typeof st.zoom[k] === 'number') o.zoom = st.zoom[k];
+        if (st.muted && st.muted[k]) o.muted = true;
+        const savedUrl = st.urls && st.urls[k];
+        if (savedUrl && savedUrl !== o.app.url) o.pendingUrl = savedUrl;
+    });
+}
+
+function restoreSessionUi(st) {
+    if (st.sidebarCollapsed) sidebar.classList.add('collapsed');
+
+    const activeObj = findAppByKey(st.activeApp) || webviews[0] || null;
+    const splitObj = findAppByKey(st.splitApp);
+    const wantSplit = !!(st.splitView && activeObj && splitObj && splitObj !== activeObj);
+
+    if (wantSplit) {
+        setSplitView(true);
+        const savedPane = st.activePane === 'right' ? 'right' : 'left';
+        activePane = savedPane === 'right' ? 'left' : 'right';
+        activateApp(splitObj);   // fills the inactive pane first...
+        activePane = savedPane;
+    } else {
+        activePane = 'left';
+    }
+    if (activeObj) activateApp(activeObj); // ...then the active app takes its pane back
+    setPane(activePane);
+}
+
+// Final flush before the window goes away (app quit / reload)
+window.addEventListener('beforeunload', () => {
+    if (sessionSaveTimer) { clearTimeout(sessionSaveTimer); sessionSaveTimer = null; }
+    if (window.api.saveSession) {
+        try { window.api.saveSession(buildSessionState()); } catch (e) {}
+    }
+});
 
 // ---------- Sidebar rendering ----------
 
@@ -435,9 +584,16 @@ async function init() {
     if (window.api.getSettings) {
         try { uiSettings = { ...uiSettings, ...(await window.api.getSettings()) }; applyTheme(); } catch (e) {}
     }
+    let session = {};
+    if (window.api.getSession) {
+        try { session = (await window.api.getSession()) || {}; } catch (e) {}
+    }
     const config = await window.api.getConfig();
     renderSidebar(config);
-    if (webviews.length > 0) activateApp(webviews[0]);
+    applySessionToApps(session);   // per-app zoom / muted / saved URL
+    restoreSessionUi(session);     // active app, sidebar, split view
+    sessionReady = true;
+    persistSession(true);          // normalize (drops keys for removed apps)
     startBackgroundLoop();
 }
 
@@ -463,6 +619,7 @@ function buildPaletteOptions() {
     const commands = [
         { name: 'Toggle Split View', icon: '◫', action: () => document.getElementById('btn-split').click() },
         { name: 'Toggle Sidebar', icon: '☰', action: () => document.getElementById('btn-toggle-sidebar').click() },
+        { name: 'Find in page', icon: '🔍', action: () => openFind() },
         { name: 'Open Settings', icon: '⚙️', action: () => document.getElementById('btn-settings').click() },
         { name: 'Open Vault', icon: '🔑', action: () => document.getElementById('btn-vault').click() },
         { name: 'Reload Active Tab', icon: '↻', action: () => document.getElementById('btn-reload').click() },
@@ -529,21 +686,24 @@ paletteInput.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); if (items.length) paletteIdx = (paletteIdx + 1) % items.length; renderPalette(); }
     if (e.key === 'ArrowUp') { e.preventDefault(); if (items.length) paletteIdx = (paletteIdx - 1 + items.length) % items.length; renderPalette(); }
     if (e.key === 'Enter' && items.length > 0) { items[paletteIdx].click(); }
-    if (e.key === 'Escape') { closePalette(); }
+    if (e.key === 'Escape') { e.stopPropagation(); closePalette(); }
 });
 paletteOverlay.addEventListener('click', (e) => { if (e.target === paletteOverlay) closePalette(); });
 document.getElementById('palette-hint').addEventListener('click', openPalette);
 
 // ---------- Keyboard shortcuts ----------
-// The heavy chords (Ctrl+K / Ctrl+B / Ctrl+1-9 / Ctrl+Shift+S) are intercepted
-// by the main process so they work even while a webview has focus, and arrive
-// here over IPC. Renderer-side we only handle plain Escape for modals.
+// The heavy chords (Ctrl+K / Ctrl+B / Ctrl+F / Ctrl+1-9 / Ctrl+Shift+S / Ctrl+Shift+M /
+// Ctrl+= - 0) are intercepted by the main process so they work even while a webview
+// has focus, and arrive here over IPC. Renderer-side we only handle plain Escape
+// for modals & the find bar.
 
 function handleGlobalShortcut(cmd) {
     if (cmd === 'palette') openPalette();
-    else if (cmd === 'toggle-sidebar') sidebar.classList.toggle('collapsed');
+    else if (cmd === 'toggle-sidebar') toggleSidebar();
     else if (cmd === 'toggle-split') document.getElementById('btn-split').click();
-    else if (cmd === 'find') { /* Find-in-page arrives in Phase 3 */ }
+    else if (cmd === 'find') openFind();
+    else if (cmd === 'toggle-mute') toggleMute(activeAppObj());
+    else if (cmd.startsWith('zoom-')) handleZoomCmd(cmd);
     else if (cmd.startsWith('app:')) {
         const idx = parseInt(cmd.slice(4), 10) - 1;
         if (webviews[idx]) activateApp(webviews[idx]);
@@ -553,8 +713,17 @@ if (window.api.onGlobalShortcut) window.api.onGlobalShortcut(handleGlobalShortcu
 
 window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-        const open = document.querySelector('.modal-overlay.show');
-        if (open) open.classList.remove('show');
+        // Close the TOPMOST open modal (palette renders above settings/vault)
+        const shown = [...document.querySelectorAll('.modal-overlay.show')];
+        const open = shown[shown.length - 1];
+        if (open) {
+            // The settings modal guards against dropping unsaved editor changes
+            if (open === settingsModal) requestCloseSettings();
+            else open.classList.remove('show');
+            return;
+        }
+        // Otherwise Escape closes an open find bar (Chrome-style)
+        if (findBar.classList.contains('show')) closeFind();
     }
 });
 
@@ -720,31 +889,131 @@ document.getElementById('btn-save-vault').addEventListener('click', async () => 
 
 // ---------- Toolbar ----------
 
-document.getElementById('btn-toggle-sidebar').onclick = () => sidebar.classList.toggle('collapsed');
+function toggleSidebar() {
+    sidebar.classList.toggle('collapsed');
+    persistSession(true);
+}
+document.getElementById('btn-toggle-sidebar').onclick = toggleSidebar;
 
-document.getElementById('btn-split').onclick = () => {
-    isSplit = !isSplit;
-    document.getElementById('right-pane').style.display = isSplit ? 'flex' : 'none';
-    divider.style.display = isSplit ? 'block' : 'none';
+function setSplitView(on) {
+    if (isSplit === on) return;
+    isSplit = on;
+    document.getElementById('right-pane').style.display = on ? 'flex' : 'none';
+    divider.style.display = on ? 'block' : 'none';
 
-    if (!isSplit) {
+    if (!on) {
         document.getElementById('left-pane').style.flex = '1 1 0%';
         Array.from(rightStack.children).forEach(child => {
             child.style.display = 'none';
             leftStack.appendChild(child);
         });
         setPane('left');
-        showToast('Split view disabled', '🔲');
-    } else {
-        showToast('Split view active (drag center divider)', '◫');
     }
     syncActiveStates();
     updateNavState();
+    persistSession(true);
+}
+
+document.getElementById('btn-split').onclick = () => {
+    setSplitView(!isSplit);
+    showToast(isSplit ? 'Split view active (drag center divider)' : 'Split view disabled', isSplit ? '◫' : '🔲');
 };
 
 document.getElementById('btn-back').onclick = () => { const wv = getActiveWebview(); if (wv) { try { wv.goBack(); } catch (e) {} } };
 document.getElementById('btn-forward').onclick = () => { const wv = getActiveWebview(); if (wv) { try { wv.goForward(); } catch (e) {} } };
 document.getElementById('btn-reload').onclick = () => { const wv = getActiveWebview(); if (wv) { try { wv.reload(); } catch (e) {} } };
+
+// ---------- Zoom & audio (per-app, remembered in session.json) ----------
+
+const ZOOM_MIN = 0.5, ZOOM_MAX = 2.0, ZOOM_STEP = 0.1;
+
+function setAppZoom(o, factor, silent) {
+    if (!o) return;
+    o.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(factor * 10) / 10));
+    if (o.wv) { try { o.wv.setZoomFactor(o.zoom); } catch (e) {} }
+    if (!silent) showToast(`Zoom ${Math.round(o.zoom * 100)}%`, '🔍');
+    persistSession(true);
+}
+
+function handleZoomCmd(cmd) {
+    const o = activeAppObj();
+    if (!o) return;
+    const cur = typeof o.zoom === 'number' ? o.zoom : 1;
+    if (cmd === 'zoom-in') setAppZoom(o, cur + ZOOM_STEP);
+    else if (cmd === 'zoom-out') setAppZoom(o, cur - ZOOM_STEP);
+    else setAppZoom(o, 1); // zoom-reset
+}
+
+function toggleMute(o) {
+    if (!o) return;
+    o.muted = !o.muted;
+    if (o.wv) { try { o.wv.setAudioMuted(o.muted); } catch (e) {} }
+    updateMuteButton();
+    showToast(`${o.app.name} ${o.muted ? 'muted' : 'unmuted'}`, o.muted ? '🔇' : '🔊');
+    persistSession(true);
+}
+
+function updateMuteButton() {
+    const o = activeAppObj();
+    document.getElementById('btn-mute').classList.toggle('muted', !!(o && o.muted));
+}
+
+document.getElementById('btn-mute').onclick = () => toggleMute(activeAppObj());
+
+// ---------- Find in page (native find on the active guest webContents) ----------
+
+const findBar = document.getElementById('find-bar');
+const findInput = document.getElementById('find-input');
+const findCount = document.getElementById('find-count');
+let findBarWv = null;   // webview the current find session belongs to
+let findDebounce = null;
+
+function openFind() {
+    if (!getActiveWebview()) {
+        showToast('No active app to search', '🔍');
+        return;
+    }
+    findBar.classList.add('show');
+    findInput.focus();
+    findInput.select();
+}
+
+function closeFind() {
+    if (findBarWv) { try { findBarWv.stopFindInPage('clearSelection'); } catch (e) {} }
+    findBarWv = null;
+    findBar.classList.remove('show');
+    findCount.textContent = '';
+}
+
+function runFind(term, forward, newSession) {
+    const wv = getActiveWebview();
+    if (!wv) return;
+    if (!term) {
+        if (findBarWv) { try { findBarWv.stopFindInPage('clearSelection'); } catch (e) {} }
+        findBarWv = null;
+        findCount.textContent = '';
+        return;
+    }
+    // A different guest (or a brand-new search) must start its own find session
+    const fresh = findBarWv !== wv;
+    findBarWv = wv;
+    try { wv.findInPage(term, { forward: forward !== false, findNext: !!newSession || fresh }); } catch (e) {}
+}
+
+findInput.addEventListener('input', () => {
+    clearTimeout(findDebounce);
+    findDebounce = setTimeout(() => runFind(findInput.value.trim(), true, true), 150);
+});
+findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        runFind(findInput.value.trim(), !e.shiftKey, false); // Enter = next, Shift+Enter = prev
+    }
+});
+document.getElementById('find-next').onclick = () => runFind(findInput.value.trim(), true, false);
+document.getElementById('find-prev').onclick = () => runFind(findInput.value.trim(), false, false);
+document.getElementById('find-close').onclick = closeFind;
+document.getElementById('btn-find').onclick = openFind;
 
 // ---------- Settings Manager (Appearance / Profiles & Apps / Advanced) ----------
 
@@ -752,6 +1021,27 @@ const settingsModal = document.getElementById('settings-modal');
 const profilesEditor = document.getElementById('profiles-editor');
 const configEditorEl = document.getElementById('config-editor');
 let settingsTab = 'appearance';
+
+// Unsaved-changes guard — only editor / JSON edits count as dirty; appearance
+// changes apply live and close without confirmation.
+let settingsDirty = false;
+
+function markSettingsDirty() { settingsDirty = true; }
+
+function requestCloseSettings() {
+    if (!settingsDirty) {
+        settingsModal.classList.remove('show');
+        return;
+    }
+    // The app has no native confirm() — close with the toast-action pattern
+    showToast('Discard unsaved settings changes?', '⚠️', {
+        label: 'Discard',
+        onClick: () => {
+            settingsDirty = false;
+            settingsModal.classList.remove('show');
+        }
+    });
+}
 
 function appItemMarkup(app) {
     app = app || {};
@@ -824,6 +1114,7 @@ function validateConfig(cfg) {
 }
 
 // Delegated actions inside the profiles editor
+profilesEditor.addEventListener('input', markSettingsDirty); // field & custom-CSS edits
 profilesEditor.addEventListener('click', (e) => {
     const btn = e.target.closest('button');
     if (!btn) return;
@@ -832,10 +1123,13 @@ profilesEditor.addEventListener('click', (e) => {
 
     if (btn.classList.contains('app-del')) {
         item.remove();
+        markSettingsDirty();
     } else if (btn.classList.contains('app-up') && item && item.previousElementSibling) {
         item.parentNode.insertBefore(item, item.previousElementSibling);
+        markSettingsDirty();
     } else if (btn.classList.contains('app-down') && item && item.nextElementSibling) {
         item.parentNode.insertBefore(item.nextElementSibling, item);
+        markSettingsDirty();
     } else if (btn.classList.contains('app-css') && item) {
         const open = item.classList.toggle('css-open');
         btn.classList.toggle('css-on', open);
@@ -843,12 +1137,16 @@ profilesEditor.addEventListener('click', (e) => {
     } else if (btn.classList.contains('app-add')) {
         btn.insertAdjacentHTML('beforebegin', appItemMarkup({ name: '', url: '' }));
         btn.previousElementSibling.querySelector('.app-name-in').focus();
+        markSettingsDirty();
     } else if (btn.classList.contains('prof-del')) {
         card.remove();
+        markSettingsDirty();
     } else if (btn.classList.contains('prof-up') && card && card.previousElementSibling) {
         profilesEditor.insertBefore(card, card.previousElementSibling);
+        markSettingsDirty();
     } else if (btn.classList.contains('prof-down') && card && card.nextElementSibling) {
         profilesEditor.insertBefore(card.nextElementSibling, card);
+        markSettingsDirty();
     }
 });
 
@@ -856,7 +1154,10 @@ document.getElementById('btn-add-profile').addEventListener('click', () => {
     profilesEditor.insertAdjacentHTML('beforeend', profileCardMarkup('', []));
     const cards = profilesEditor.querySelectorAll('.profile-card');
     cards[cards.length - 1].querySelector('.profile-name').focus();
+    markSettingsDirty();
 });
+
+configEditorEl.addEventListener('input', markSettingsDirty); // Advanced JSON edits
 
 // Tab switching (Advanced JSON syncs in both directions)
 function switchSettingsTab(name) {
@@ -944,10 +1245,16 @@ document.getElementById('btn-settings').onclick = async () => {
     syncAppearanceControls();
     settingsTab = 'profiles'; // sentinel: force panel refresh without re-syncing
     switchSettingsTab('appearance');
+    settingsDirty = false;
     settingsModal.classList.add('show');
 };
 
-document.getElementById('btn-cancel-settings').onclick = () => settingsModal.classList.remove('show');
+document.getElementById('btn-cancel-settings').onclick = requestCloseSettings;
+
+// Clicking the backdrop also closes — but never silently drops editor edits
+settingsModal.addEventListener('click', (e) => {
+    if (e.target === settingsModal) requestCloseSettings();
+});
 
 document.getElementById('btn-save-settings').onclick = () => {
     let cfg;
@@ -974,6 +1281,7 @@ document.getElementById('btn-save-settings').onclick = () => {
     }
 
     window.api.saveConfig(cfg);
+    settingsDirty = false;
     settingsModal.classList.remove('show');
     showToast('Settings saved — reloading…', '✅');
     // Reload the UI in place: the app stays open and sessions persist

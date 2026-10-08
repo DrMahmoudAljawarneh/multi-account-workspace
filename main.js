@@ -67,6 +67,11 @@ function handleGlobalShortcut(event, input) {
     else if (key === 'b') cmd = 'toggle-sidebar';
     else if (key === 'f') cmd = 'find';
     else if (key === 's' && input.shift) cmd = 'toggle-split';
+    else if (key === 'm' && input.shift) cmd = 'toggle-mute';
+    // Zoom: Ctrl+= / Ctrl++ (shift) step up, Ctrl+- / Ctrl+_ (shift) step down, Ctrl+0 resets
+    else if (key === '=' || key === '+') cmd = 'zoom-in';
+    else if (key === '-' || key === '_') cmd = 'zoom-out';
+    else if (key === '0') cmd = 'zoom-reset';
     else if (key >= '1' && key <= '9') cmd = 'app:' + key;
 
     if (cmd) {
@@ -179,6 +184,35 @@ ipcMain.on('save-config', (event, newConfig) => {
 
 ipcMain.handle('get-preload-path', () => {
     return 'file://' + path.join(__dirname, 'webview-preload.js');
+});
+
+// --- Session state (active app / split / zoom / mute / last URLs) ---
+// Lives NEXT TO config.json (same path resolution), never in settings.json —
+// that file is shared with the Flutter build and its schema must not change.
+function resolveSessionPath() {
+    return path.join(path.dirname(resolveConfigPath()), 'session.json');
+}
+
+ipcMain.handle('get-session', () => {
+    try {
+        const sessionPath = resolveSessionPath();
+        if (fs.existsSync(sessionPath)) {
+            return JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+        }
+    } catch (e) {
+        console.error('Session read failed:', e);
+    }
+    return {};
+});
+
+ipcMain.on('save-session', (event, data) => {
+    try {
+        const sessionPath = resolveSessionPath();
+        fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+        fs.writeFileSync(sessionPath, JSON.stringify(data, null, 4));
+    } catch (e) {
+        console.error('Session write failed:', e);
+    }
 });
 
 // --- Local Favicon Cache -----------------------------------------------------
