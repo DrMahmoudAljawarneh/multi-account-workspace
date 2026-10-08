@@ -26,6 +26,7 @@ class _VaultDialogState extends State<VaultDialog> {
   final _appCtrl = TextEditingController();
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
+  final _domainCtrl = TextEditingController();
   bool _obscurePass = true;
   String? _formError;
 
@@ -40,6 +41,7 @@ class _VaultDialogState extends State<VaultDialog> {
     _appCtrl.addListener(_formEdited);
     _userCtrl.addListener(_formEdited);
     _passCtrl.addListener(_formEdited);
+    _domainCtrl.addListener(_formEdited);
     _reload();
   }
 
@@ -50,7 +52,7 @@ class _VaultDialogState extends State<VaultDialog> {
   }
 
   String get _formText =>
-      '${_appCtrl.text}|${_userCtrl.text}|${_passCtrl.text}';
+      '${_appCtrl.text}|${_userCtrl.text}|${_passCtrl.text}|${_domainCtrl.text}';
 
   bool get _formDirty => _showForm && _formText != _formSnapshot;
 
@@ -61,6 +63,7 @@ class _VaultDialogState extends State<VaultDialog> {
     _appCtrl.dispose();
     _userCtrl.dispose();
     _passCtrl.dispose();
+    _domainCtrl.dispose();
     super.dispose();
   }
 
@@ -80,6 +83,7 @@ class _VaultDialogState extends State<VaultDialog> {
       _restoringForm = true;
       _appCtrl.text = entry?.appName ?? '';
       _userCtrl.text = entry?.username ?? '';
+      _domainCtrl.text = entry?.domain ?? '';
       _passCtrl.text = _passwords[entry?.appName] ?? '';
       _captureSnapshot();
       _restoringForm = false;
@@ -128,6 +132,7 @@ class _VaultDialogState extends State<VaultDialog> {
       appName: app,
       username: _userCtrl.text.trim(),
       password: _passCtrl.text,
+      domain: _domainCtrl.text.trim(),
     );
     if (!mounted) return;
     if (!ok) {
@@ -192,6 +197,13 @@ class _VaultDialogState extends State<VaultDialog> {
                   ),
                   overflow: TextOverflow.ellipsis,
                 ),
+                if (entry.domain != null)
+                  Text(
+                    entry.domain!,
+                    style: TextStyle(
+                        fontSize: 11, color: scheme.primary),
+                    overflow: TextOverflow.ellipsis,
+                  ),
               ],
             ),
           ),
@@ -306,6 +318,17 @@ class _VaultDialogState extends State<VaultDialog> {
             obscureText: _obscurePass,
             decoration: decoration('Password', isPass: true),
             style: const TextStyle(fontSize: 13.5),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _domainCtrl,
+            decoration: decoration('Domain (optional, e.g. gmail.com)'),
+            style: const TextStyle(fontSize: 13.5),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Used to auto-fill this entry on matching sites.',
+            style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
           ),
           if (_formError != null) ...[
             const SizedBox(height: 8),

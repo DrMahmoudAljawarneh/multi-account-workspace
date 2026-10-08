@@ -28,7 +28,18 @@ class SidebarPanel extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
     final profiles = ref.watch(profilesProvider);
-    final activeId = ref.watch(activeProfileIdProvider);
+    final mainId = ref.watch(activeProfileIdProvider);
+    final splitId = ref.watch(activeProfileId2Provider);
+    final splitOn = ref.watch(isSplitViewEnabledProvider);
+    final focusedPane = ref.watch(focusedPaneProvider);
+    // Highlight follows the pane that a click will switch — the split pane
+    // only when split view is on and focused, the main pane otherwise.
+    final activeId = activeIdForInteraction(
+      splitView: splitOn,
+      focusedPane: focusedPane,
+      mainId: mainId,
+      splitId: splitId,
+    );
     final selectedIndex = indexForId(profiles, activeId);
     final unreadCounts = ref.watch(unreadCountsProvider);
     final isSidebarExpanded = ref.watch(isSidebarExpandedProvider);
@@ -96,9 +107,7 @@ class SidebarPanel extends ConsumerWidget {
                 final isSelected = index == selectedIndex;
                 final unread = unreadCounts[profile.id] ?? 0;
                 return GestureDetector(
-                  onTap: () => ref
-                      .read(activeProfileIdProvider.notifier)
-                      .select(profile.id),
+                  onTap: () => selectIntoFocusedPane(ref, profile.id),
                   child: Container(
                     margin: const EdgeInsets.symmetric(vertical: 8),
                     child: Row(

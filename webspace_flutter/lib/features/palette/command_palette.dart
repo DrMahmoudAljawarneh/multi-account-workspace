@@ -53,7 +53,7 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
               subtitle: 'Bigger content in the current app (Ctrl +)',
               icon: Icons.zoom_in,
               run: () {
-                final id = ref.read(activeProfileIdProvider);
+                final id = focusedActiveId(ref);
                 if (id != null) ViewportCommands.zoomIn(ref, id);
               },
             ),
@@ -62,7 +62,7 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
               subtitle: 'Smaller content in the current app (Ctrl -)',
               icon: Icons.zoom_out,
               run: () {
-                final id = ref.read(activeProfileIdProvider);
+                final id = focusedActiveId(ref);
                 if (id != null) ViewportCommands.zoomOut(ref, id);
               },
             ),
@@ -71,7 +71,7 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
               subtitle: 'Back to 100% (Ctrl+0)',
               icon: Icons.search_off,
               run: () {
-                final id = ref.read(activeProfileIdProvider);
+                final id = focusedActiveId(ref);
                 if (id != null) ViewportCommands.zoomReset(ref, id);
               },
             ),
@@ -80,7 +80,7 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
               subtitle: 'Silence the current app (Ctrl+Shift+M)',
               icon: Icons.volume_off,
               run: () {
-                final id = ref.read(activeProfileIdProvider);
+                final id = focusedActiveId(ref);
                 if (id != null) ViewportCommands.toggleMute(ref, id);
               },
             ),
@@ -145,9 +145,8 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
                       if (filteredActions.isNotEmpty) {
                         pendingAction = filteredActions.first.run;
                       } else if (filteredProfiles.isNotEmpty) {
-                        ref
-                            .read(activeProfileIdProvider.notifier)
-                            .select(filteredProfiles.first.id);
+                        selectIntoFocusedPane(
+                            ref, filteredProfiles.first.id);
                       }
                       Navigator.of(context).pop();
                     },
@@ -187,9 +186,7 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
                               title: Text(profile.name),
                               subtitle: Text(profile.initialUrl),
                               onTap: () {
-                                ref
-                                    .read(activeProfileIdProvider.notifier)
-                                    .select(profile.id);
+                                selectIntoFocusedPane(ref, profile.id);
                                 Navigator.of(context).pop();
                               },
                             ),

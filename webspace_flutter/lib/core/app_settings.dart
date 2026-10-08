@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'atomic_write.dart';
+
 /// App UI settings.
 ///
 /// Deliberately shares `~/.config/webspace/settings.json` with the Electron
@@ -66,8 +68,8 @@ class SettingsStore {
   static Future<void> save(AppSettings settings) async {
     try {
       final file = File(filePath);
-      file.parent.createSync(recursive: true);
-      await file.writeAsString(
+      await atomicWrite(
+        file,
         const JsonEncoder.withIndent('  ').convert(settings.toJson()),
       );
     } catch (_) {

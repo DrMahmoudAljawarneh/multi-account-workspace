@@ -32,10 +32,8 @@ class _FindBarState extends ConsumerState<FindBar> {
       setState(() => _noMatch = false);
       return;
     }
-    final activeId = ref.read(activeProfileIdProvider);
-    if (activeId == null) return;
     final controller =
-        ref.read(webviewControllersProvider)['main_$activeId'];
+        ref.read(webviewControllersProvider)[_focusedKey];
     if (controller == null) return;
 
     // window.find(searchString, caseSensitive, backwards, wrapAround,
@@ -59,23 +57,35 @@ class _FindBarState extends ConsumerState<FindBar> {
   }
 
   void _close() {
-    final activeId = ref.read(activeProfileIdProvider);
-    if (activeId != null) {
-      final controller =
-          ref.read(webviewControllersProvider)['main_$activeId'];
-      controller
-          ?.runJavaScript('window.getSelection().removeAllRanges();')
-          .catchError((_) {});
-    }
+    final controller =
+        ref.read(webviewControllersProvider)[_focusedKey];
+    controller
+        ?.runJavaScript('window.getSelection().removeAllRanges();')
+        .catchError((_) {});
     ref.read(isFindOpenProvider.notifier).setOpen(false);
   }
+
+  /// Registry key of the webview find should search: the focused pane's
+  /// active app (main pane unless split view is focused).
+  String? get _focusedKey => controllerKeyForInteraction(
+        splitView: ref.read(isSplitViewEnabledProvider),
+        focusedPane: ref.read(focusedPaneProvider),
+        mainId: ref.read(activeProfileIdProvider),
+        splitId: ref.read(activeProfileId2Provider),
+      );
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final activeId = ref.watch(activeProfileIdProvider);
-    final hasController = activeId != null &&
-        ref.watch(webviewControllersProvider).containsKey('main_$activeId');
+    // Watched so the bar re-evaluates when pane focus or selection changes.
+    final focusedKey = controllerKeyForInteraction(
+      splitView: ref.watch(isSplitViewEnabledProvider),
+      focusedPane: ref.watch(focusedPaneProvider),
+      mainId: ref.watch(activeProfileIdProvider),
+      splitId: ref.watch(activeProfileId2Provider),
+    );
+    final hasController = focusedKey != null &&
+        ref.watch(webviewControllersProvider).containsKey(focusedKey);
 
     return Container(
       width: 340,

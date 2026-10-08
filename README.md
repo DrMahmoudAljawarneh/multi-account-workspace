@@ -90,7 +90,9 @@ Outputs in `dist/`:
 
 ## ☁️ Automated CI/CD via GitHub Actions
 
-This repository includes a pre-configured GitHub Actions workflow (`.github/workflows/build.yml`) that builds Linux and Windows binaries concurrently in the cloud:
+This repository includes two workflows:
+
+- **`.github/workflows/build.yml`** — builds the Electron Linux and Windows binaries concurrently in the cloud:
 
 1. Push your code to GitHub:
    ```bash
@@ -100,6 +102,68 @@ This repository includes a pre-configured GitHub Actions workflow (`.github/work
    ```
 2. Navigate to your repository on GitHub and open the **Actions** tab.
 3. Once the build completes, download your ready-to-run installers directly from the **Artifacts** or **Releases** section.
+
+- **`.github/workflows/flutter.yml`** — runs the Flutter gate (`flutter analyze`, `flutter test`, `./build.sh`) and uploads the Linux `.deb` + desktop entry as artifacts. The same gate runs locally with:
+
+```bash
+./webspace_flutter/ci.sh
+```
+
+---
+
+## 🐧 WebSpace Flutter (native Linux build)
+
+`webspace_flutter/` is a native GTK/Flutter port of WebSpace with the same
+feature set (profiles from the shared `config.json`, split view, command
+palette, credential vault, hibernation, tray) plus native-only niceties.
+
+### Prerequisites
+- Flutter SDK (stable channel)
+- `libsecret-1` runtime (already present on most desktops; the `-dev`
+  headers are vendored in `webspace_flutter/linux/deps/` and extracted
+  automatically by `build.sh` if the system lacks them)
+
+### Run / build
+```bash
+cd webspace_flutter
+
+# Development run
+flutter run -d linux
+
+# Full release gate (analyze + test + package)
+./ci.sh
+
+# Or just the release build + packaging
+./build.sh
+```
+
+`build.sh` produces:
+- `dist/webspace/` — release bundle (binary named `webspace`)
+- `dist/webspace.desktop` — desktop entry with absolute paths (local install)
+- `dist/webspace_<ver>_amd64.deb` — self-contained Debian package
+  (`/opt/webspace` + `/usr/bin/webspace` wrapper; install with
+  `sudo dpkg -i`). Version override: `WEBSPACE_VERSION=x.y.z ./build.sh`.
+  *(AppImage is not built — it requires downloading `appimagetool`.)*
+
+### Flutter-only shortcuts & behaviors
+- `Ctrl + 1…9`, `Ctrl+K`, `Ctrl+B`, `Ctrl+F`, `Ctrl+Shift+S`, `Ctrl+Shift+M`,
+  `Ctrl +/−/0` — same as Electron; **Ctrl + wheel** also zooms the current app.
+- **Split view panes have slim headers**: click a header to focus that pane —
+  sidebar picks, `Ctrl+1…9`, find, toolbar nav and mute/zoom then target it.
+  The main header hosts **swap panes**, the second header **close split**.
+- **Window placement & zoom state persist** across restarts
+  (`session.flutter.json` next to `config.json`, alongside Electron's
+  `session.json` — the three schemas never touch each other or `settings.json`).
+- **Camera / microphone requests prompt** before access (deny-by-default
+  otherwise); JS `alert()/confirm()/prompt()` show real dialogs instead of
+  being silently auto-confirmed.
+- **Auto-fill is domain-gated**: credentials are only offered on the
+  profile's own domain(s) (registrable-domain match). Submitting a real
+  login form raises a *"Save password for …?"* snackbar; entries store an
+  optional `domain` for matching and show it in the vault.
+- `target=_blank` / `window.open` links load **in the same pane** (native
+  plugin behavior — WebSpace has no popup windows). Downloads are handled by
+  WebKitGTK directly (no in-app download UI yet).
 
 ---
 

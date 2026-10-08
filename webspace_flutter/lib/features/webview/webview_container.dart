@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:local_notifier/local_notifier.dart';
 import '../../core/providers.dart';
+import '../../core/host_match.dart';
 import '../../core/session_store.dart';
 import '../../core/vault_service.dart';
 import '../../core/viewport.dart';
@@ -42,6 +43,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   String _loadErrorMessage = '';
   Timer? _hibernationTimer;
 
+  /// Current page URL, updated on navigation — the anchor for host checks
+  /// (auto-fill / save prompts) and permission dialog captions.
+  String _lastUrl = '';
+
   String get _registryKey => '${widget.pane}_${widget.profileId}';
 
   /// True when this profile is the active app in either pane (by stable id).
@@ -72,12 +77,22 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   }
 
   void _initializeWebview() {
-    _controller = WebViewController()
+    _controller = WebViewController(onPermissionRequest: _handlePermissionRequest)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0")
       ..setOnConsoleMessage((message) {
         debugPrint('WebView Console: ${message.message}');
       })
+      // Surface JS alert()/confirm()/prompt() in Flutter dialogs — without
+      // these handlers the Linux plugin silently auto-confirms every dialog,
+      // so pages that talk to the user via alert() just appear broken.
+      ..setOnJavaScriptAlertDialog((request) async {
+        await _showJsAlert(request.message, request.url);
+      })
+      ..setOnJavaScriptConfirmDialog((request) async =>
+          _showJsConfirm(request.message, request.url))
+      ..setOnJavaScriptTextInputDialog((request) async =>
+          _showJsPrompt(request.message, request.url, request.defaultText ?? ''))
       ..addJavaScriptChannel(
         'FlutterCommandPalette',
         onMessageReceived: (JavaScriptMessage message) {
@@ -100,6 +115,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             _adjustZoom(0.1);
           } else if (message.message == 'zoomOut') {
             _adjustZoom(-0.1);
+          } else if (message.message == 'zoomWheelIn') {
+            _adjustZoom(0.1);
+          } else if (message.message == 'zoomWheelOut') {
+            _adjustZoom(-0.1);
           } else if (message.message == 'zoomReset') {
             _adjustZoom(null);
           } else if (message.message == 'toggleMute') {
@@ -112,12 +131,29 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             final idx = int.tryParse(message.message.substring(5)) ?? -1;
             final profiles = ref.read(profilesProvider);
             if (idx >= 0 && idx < profiles.length) {
-              ref
-                  .read(activeProfileIdProvider.notifier)
-                  .select(profiles[idx].id);
+              // Keys pressed inside a pane switch apps in THAT pane, so
+              // Ctrl+1..9 works per-pane while split view is active.
+              if (widget.pane == 'split') {
+                ref
+                    .read(activeProfileId2Provider.notifier)
+                    .select(profiles[idx].id);
+              } else {
+                ref
+                    .read(activeProfileIdProvider.notifier)
+                    .select(profiles[idx].id);
+              }
             }
           } else if (message.message == 'autofill:need') {
             _tryAutofill();
+          } else if (message.message.startsWith('creds:')) {
+            final parts = message.message.split(':');
+            if (parts.length == 3) {
+              final user = _decodeBase64(parts[1]);
+              final pass = _decodeBase64(parts[2]);
+              if (user != null && pass != null) {
+                _handleCredsCandidate(user, pass);
+              }
+            }
           }
         },
       )
@@ -129,6 +165,7 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             }
           },
           onPageStarted: (String url) {
+            _lastUrl = url;
             if (mounted) {
               setState(() {
                 _isLoading = true;
@@ -179,16 +216,18 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             }
 
             // Inject script to listen for shortcuts since WebViews swallow
-            // hardware keys — mirrors the Flutter-side handlers.
+            // hardware keys — mirrors the Flutter-side handlers. Ctrl+wheel
+            // is captured here too so CSS zoom (not WebKit's native page
+            // zoom) stays the single zoom system.
             _controller.runJavaScript('''
               if (!window.shortcutInjected) {
+                var post = function(msg) {
+                  if (typeof FlutterCommandPalette !== 'undefined') {
+                    FlutterCommandPalette.postMessage(msg);
+                  }
+                };
                 document.addEventListener('keydown', function(e) {
                   if (!e.ctrlKey) return;
-                  var post = function(msg) {
-                    if (typeof FlutterCommandPalette !== 'undefined') {
-                      FlutterCommandPalette.postMessage(msg);
-                    }
-                  };
                   var k = e.key;
                   if (k === 'k') { e.preventDefault(); post('openCommandPalette'); }
                   else if (k === 'f') { e.preventDefault(); post('openFind'); }
@@ -200,6 +239,11 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
                   else if ((k === 'M' || k === 'm') && e.shiftKey) { e.preventDefault(); post('toggleMute'); }
                   else if (k >= '1' && k <= '9') { e.preventDefault(); post('goto:' + (parseInt(k, 10) - 1)); }
                 });
+                window.addEventListener('wheel', function(e) {
+                  if (!e.ctrlKey) return;
+                  e.preventDefault();
+                  post(e.deltaY < 0 ? 'zoomWheelIn' : 'zoomWheelOut');
+                }, { passive: false });
                 window.shortcutInjected = true;
               }
             ''');
@@ -242,14 +286,40 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             ViewportCommands.reapplyOnLoad(ref, widget.profileId, (js) =>
                 _controller.runJavaScript(js));
 
-            // Look for a login form and ask Dart to auto-fill it silently
+            // Look for a login form and ask Dart to auto-fill it silently —
+            // but only when this page is on the profile's own domain(s), so
+            // credentials never leak into an unrelated site's form.
+            if (_isTrustedHostFor(url)) {
+              _controller.runJavaScript('''
+                setTimeout(function() {
+                  if (document.querySelector('input[type=password]') &&
+                      typeof FlutterCommandPalette !== 'undefined') {
+                    FlutterCommandPalette.postMessage('autofill:need');
+                  }
+                }, 600);
+              ''');
+            }
+
+            // Watch real form submissions so Dart can offer to save the
+            // password (browsers-style "Save password?" snackbar).
             _controller.runJavaScript('''
-              setTimeout(function() {
-                if (document.querySelector('input[type=password]') &&
-                    typeof FlutterCommandPalette !== 'undefined') {
-                  FlutterCommandPalette.postMessage('autofill:need');
-                }
-              }, 600);
+              if (!window.credsHookInjected) {
+                document.addEventListener('submit', function(e) {
+                  var form = e.target;
+                  if (!form || form.tagName !== 'FORM') return;
+                  var pw = form.querySelector('input[type=password]');
+                  if (!pw || !pw.value) return;
+                  var user = form.querySelector('input[type=email],input[type=text],input[name*="user" i],input[name*="login" i],input[name*="email" i]');
+                  if (!user || !user.value) return;
+                  try {
+                    var enc = function(v) { return btoa(encodeURIComponent(v)); };
+                    if (typeof FlutterCommandPalette !== 'undefined') {
+                      FlutterCommandPalette.postMessage('creds:' + enc(user.value) + ':' + enc(pw.value));
+                    }
+                  } catch (err) {}
+                }, true);
+                window.credsHookInjected = true;
+              }
             ''');
           },
         ),
@@ -303,12 +373,38 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     ref.read(isSplitViewEnabledProvider.notifier).toggle();
   }
 
-  /// Fills a detected login form from the OS keyring when the vault has an
-  /// entry matching this profile's name (silent, once per page load).
+  /// True when [url] is on the profile's own domain(s) — the gate for
+  /// auto-fill and credential-save prompts.
+  bool _isTrustedHostFor(String url) {
+    final pageHost = Uri.tryParse(url)?.host ?? '';
+    final homeHost = Uri.tryParse(widget.initialUrl)?.host ?? '';
+    return hostsMatch(pageHost, homeHost);
+  }
+
+  bool get _onTrustedHost => _isTrustedHostFor(_lastUrl);
+
+  /// Best label for dialog captions: the current page's host.
+  String get _pageHost {
+    final host = Uri.tryParse(_lastUrl)?.host ?? '';
+    return host.isEmpty ? widget.profileName : host;
+  }
+
+  String _hostOf(String url) {
+    final host = Uri.tryParse(url)?.host ?? '';
+    return host.isEmpty ? _pageHost : host;
+  }
+
+  /// Fills a detected login form from the OS keyring — the profile's named
+  /// entry first, then any vault entry whose domain matches the page host.
+  /// Silent, once per page load, and only on the profile's own domains.
   Future<void> _tryAutofill() async {
+    if (!_onTrustedHost) return;
     VaultCredential? cred;
     try {
-      cred = await VaultService.get(widget.profileName);
+      cred = await VaultService.findFor(
+        host: Uri.tryParse(_lastUrl)?.host ?? '',
+        appName: widget.profileName,
+      );
     } catch (_) {
       return;
     }
@@ -332,6 +428,174 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
         })();
       ''');
     } catch (_) {}
+  }
+
+  /// Decodes the bridge's `btoa(encodeURIComponent(v))` payload.
+  String? _decodeBase64(String encoded) {
+    try {
+      return Uri.decodeFull(utf8.decode(base64Decode(encoded)));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The page just submitted username+password: offer to store it in the
+  /// vault (save when absent, update when changed, silence when identical).
+  Future<void> _handleCredsCandidate(String user, String pass) async {
+    if (!mounted || user.isEmpty || pass.isEmpty || !_onTrustedHost) return;
+    VaultCredential? existing;
+    try {
+      existing = await VaultService.get(widget.profileName);
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    if (existing != null &&
+        existing.username == user &&
+        existing.password == pass) {
+      return;
+    }
+    final isUpdate = existing != null;
+    final host = Uri.tryParse(_lastUrl)?.host ?? '';
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(SnackBar(
+      content: Text(isUpdate
+          ? 'Update saved password for ${widget.profileName}?'
+          : 'Save password for ${widget.profileName}?'),
+      duration: const Duration(seconds: 8),
+      action: SnackBarAction(
+        label: isUpdate ? 'Update' : 'Save',
+        onPressed: () async {
+          final ok = await VaultService.save(
+            appName: widget.profileName,
+            username: user,
+            password: pass,
+            domain: host,
+          );
+          messenger.showSnackBar(SnackBar(
+            content: Text(ok
+                ? 'Password saved for ${widget.profileName}'
+                : 'Could not reach the system keyring'),
+            duration: const Duration(seconds: 2),
+          ));
+        },
+      ),
+    ));
+  }
+
+  /// Camera / microphone requests — the Linux plugin denies them outright
+  /// when no handler is installed, so ask the user first.
+  Future<void> _handlePermissionRequest(WebViewPermissionRequest request) async {
+    final wanted = request.types.map((t) => t.name).join(' and ');
+    if (!mounted) {
+      await request.deny();
+      return;
+    }
+    final granted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Allow device access?'),
+        content: Text(
+            '"$_pageHost" wants to use your $wanted.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Block'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Allow'),
+          ),
+        ],
+      ),
+    );
+    if (granted == true) {
+      await request.grant();
+    } else {
+      await request.deny();
+    }
+  }
+
+  /// JS alert() — surfaces the message instead of silently auto-confirming.
+  Future<void> _showJsAlert(String message, String url) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(_hostOf(url),
+            style: const TextStyle(fontSize: 14)),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// JS confirm() — returns the user's choice to the page.
+  Future<bool> _showJsConfirm(String message, String url) async {
+    if (!mounted) return false;
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text(_hostOf(url),
+                style: const TextStyle(fontSize: 14)),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  /// JS prompt() — prefilled text input; the plugin has no cancel path, so
+  /// dismissing returns the default value (same as today's auto-confirm).
+  Future<String> _showJsPrompt(
+      String message, String url, String defaultValue) async {
+    if (!mounted) return defaultValue;
+    final ctrl = TextEditingController(text: defaultValue);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(_hostOf(url), style: const TextStyle(fontSize: 14)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(message),
+            const SizedBox(height: 10),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              style: const TextStyle(fontSize: 13.5),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(defaultValue),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(ctrl.text),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    return result ?? defaultValue;
   }
 
   void _checkHibernation() {

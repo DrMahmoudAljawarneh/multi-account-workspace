@@ -1,0 +1,31 @@
+name: Flutter analyze, test & package
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  flutter-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Analyze, test and build
+        run: ./webspace_flutter/ci.sh
+
+      - name: Upload Linux artifacts (.deb + desktop entry)
+        uses: actions/upload-artifact@v4
+        with:
+          name: webspace-linux
+          path: |
+            webspace_flutter/dist/webspace_*.deb
+            webspace_flutter/dist/webspace.desktop

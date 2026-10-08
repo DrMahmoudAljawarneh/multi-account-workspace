@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'atomic_write.dart';
 import 'providers.dart';
 
 /// Loads / saves `config.json` using the same lookup order as the Electron
@@ -125,7 +126,8 @@ class ConfigManager {
       });
     }
 
-    await file.writeAsString(
+    await atomicWrite(
+      file,
       const JsonEncoder.withIndent('  ').convert(groups),
     );
   }

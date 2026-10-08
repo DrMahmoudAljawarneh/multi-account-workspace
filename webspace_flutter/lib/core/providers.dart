@@ -55,6 +55,59 @@ int indexForId(List<AppProfile> profiles, String? id) {
   return i < 0 ? 0 : i;
 }
 
+/// The profile id that keyboard / toolbar / find interactions currently
+/// target: the split pane's app while split view is on and focused, otherwise
+/// the main pane's app.
+String? activeIdForInteraction({
+  required bool splitView,
+  required String focusedPane,
+  required String? mainId,
+  required String? splitId,
+}) {
+  if (splitView && focusedPane == 'split') return splitId ?? mainId;
+  return mainId;
+}
+
+/// Registry key (`main_<id>` / `split_<id>`) of the webview that toolbar
+/// navigation and find-in-page should drive; null when none exists.
+String? controllerKeyForInteraction({
+  required bool splitView,
+  required String focusedPane,
+  required String? mainId,
+  required String? splitId,
+}) {
+  final id = activeIdForInteraction(
+    splitView: splitView,
+    focusedPane: focusedPane,
+    mainId: mainId,
+    splitId: splitId,
+  );
+  if (id == null) return null;
+  final splitPane = splitView && focusedPane == 'split' && splitId != null;
+  return '${splitPane ? 'split' : 'main'}_$id';
+}
+
+/// Convenience for keyboard handlers (reads current provider values).
+String? focusedActiveId(WidgetRef ref) => activeIdForInteraction(
+      splitView: ref.read(isSplitViewEnabledProvider),
+      focusedPane: ref.read(focusedPaneProvider),
+      mainId: ref.read(activeProfileIdProvider),
+      splitId: ref.read(activeProfileId2Provider),
+    );
+
+/// Selects [id] into the pane that interactions currently target: with split
+/// view on and the split pane focused, the second pane switches; everywhere
+/// else the main pane does (single-pane behavior stays exactly as before).
+void selectIntoFocusedPane(WidgetRef ref, String id) {
+  final split = ref.read(isSplitViewEnabledProvider);
+  final focused = ref.read(focusedPaneProvider);
+  if (split && focused == 'split') {
+    ref.read(activeProfileId2Provider.notifier).select(id);
+  } else {
+    ref.read(activeProfileIdProvider.notifier).select(id);
+  }
+}
+
 // 2. Pre-defined Profiles State
 class ProfilesNotifier extends Notifier<List<AppProfile>> {
   @override
@@ -125,9 +178,26 @@ class SplitViewNotifier extends Notifier<bool> {
   @override
   bool build() => initialSession.splitView;
 
-  void toggle() => state = !state;
+  void toggle() {
+    state = !state;
+    // Split pane focus is meaningless without the split pane
+    if (!state) {
+      ref.read(focusedPaneProvider.notifier).set('main');
+    }
+  }
 }
 final isSplitViewEnabledProvider = NotifierProvider<SplitViewNotifier, bool>(() => SplitViewNotifier());
+
+/// Which pane keyboard / sidebar / palette interactions target while split
+/// view is active. 'main' unless the user clicked the split pane's header.
+class FocusedPaneNotifier extends Notifier<String> {
+  @override
+  String build() => initialSession.focusedPane;
+
+  void set(String pane) => state = pane == 'split' ? 'split' : 'main';
+}
+final focusedPaneProvider =
+    NotifierProvider<FocusedPaneNotifier, String>(() => FocusedPaneNotifier());
 
 class ActiveProfileId2Notifier extends Notifier<String?> {
   @override

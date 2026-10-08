@@ -14,11 +14,26 @@ class AppToolbar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final activeId = ref.watch(activeProfileIdProvider);
     final controllers = ref.watch(webviewControllersProvider);
-    final activeController =
-        activeId == null ? null : controllers['main_$activeId'];
     final isSplit = ref.watch(isSplitViewEnabledProvider);
+    final focusedPane = ref.watch(focusedPaneProvider);
+    final mainId = ref.watch(activeProfileIdProvider);
+    final splitId = ref.watch(activeProfileId2Provider);
+    // Navigation / mute target the focused pane (main unless the user
+    // clicked the split pane's header while split view is active).
+    final activeId = activeIdForInteraction(
+      splitView: isSplit,
+      focusedPane: focusedPane,
+      mainId: mainId,
+      splitId: splitId,
+    );
+    final activeController =
+        controllers[controllerKeyForInteraction(
+      splitView: isSplit,
+      focusedPane: focusedPane,
+      mainId: mainId,
+      splitId: splitId,
+    )];
     final isMuted =
         ref.watch(mutedAppsProvider.notifier).isMuted(activeId);
     final isFindOpen = ref.watch(isFindOpenProvider);

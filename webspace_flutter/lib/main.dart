@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,6 +16,7 @@ import 'core/session_store.dart';
 import 'core/viewport.dart';
 import 'features/find/find_bar.dart';
 import 'features/palette/command_palette.dart';
+import 'features/panes/pane_header.dart';
 import 'features/sidebar/sidebar_panel.dart';
 import 'features/titlebar/app_titlebar.dart';
 import 'features/toolbar/app_toolbar.dart';
@@ -42,17 +45,38 @@ void main() async {
   
   // Initialize window manager for frameless title bar
   await windowManager.ensureInitialized();
-  WindowOptions windowOptions = const WindowOptions(
-    size: Size(1200, 800),
-    center: true,
+
+  // Restore the previous window placement when we remember one; otherwise
+  // fall back to the default 1200x800, centered as before.
+  final savedBounds = initialSession.windowBounds;
+  WindowOptions windowOptions = WindowOptions(
+    size: savedBounds != null
+        ? Size(savedBounds['width']!, savedBounds['height']!)
+        : const Size(1200, 800),
+    center: savedBounds == null,
     backgroundColor: Colors.transparent,
     skipTaskbar: false,
     title: 'WebSpace',
     titleBarStyle: TitleBarStyle.hidden, // Hides native title bar
   );
   windowManager.waitUntilReadyToShow(windowOptions, () async {
+    if (savedBounds != null) {
+      try {
+        await windowManager.setBounds(Rect.fromLTWH(
+          savedBounds['x']!,
+          savedBounds['y']!,
+          savedBounds['width']!,
+          savedBounds['height']!,
+        ));
+      } catch (_) {}
+    }
     await windowManager.setTitle('WebSpace');
     await windowManager.show();
+    if (initialSession.windowMaximized) {
+      try {
+        await windowManager.maximize();
+      } catch (_) {}
+    }
     await windowManager.focus();
     try {
       await windowManager.setIcon('assets/icon.png');
@@ -186,6 +210,7 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
 
   @override
   void dispose() {
+    _boundsTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     windowManager.removeListener(this);
     super.dispose();
@@ -197,6 +222,45 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
     if (isPreventClose) {
       windowManager.hide();
     }
+  }
+
+  Timer? _boundsTimer;
+
+  // Window placement persistence: written shortly after the user stops
+  // dragging/resizing (debounced), immediately on maximize changes.
+  @override
+  void onWindowMoved() => _queueBoundsSave();
+
+  @override
+  void onWindowResized() => _queueBoundsSave();
+
+  @override
+  void onWindowMaximize() => _persistBounds(maximized: true);
+
+  @override
+  void onWindowUnmaximize() => _persistBounds(maximized: false);
+
+  void _queueBoundsSave() {
+    _boundsTimer?.cancel();
+    _boundsTimer =
+        Timer(const Duration(milliseconds: 800), () => _persistBounds());
+  }
+
+  Future<void> _persistBounds({bool? maximized}) async {
+    try {
+      final rect = await windowManager.getBounds();
+      if (rect.width < 200 || rect.height < 200) return;
+      final isMax = maximized ?? await windowManager.isMaximized();
+      await SessionStore.patch({
+        'window': {
+          'x': rect.left,
+          'y': rect.top,
+          'width': rect.width,
+          'height': rect.height,
+        },
+        'windowMaximized': isMax,
+      });
+    } catch (_) {}
   }
 
   bool _handleGlobalKey(KeyEvent event) {
@@ -227,7 +291,7 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
         return true;
       } else if (event.logicalKey == LogicalKeyboardKey.keyM &&
           HardwareKeyboard.instance.isShiftPressed) {
-        final id = ref.read(activeProfileIdProvider);
+        final id = focusedActiveId(ref);
         if (id != null) {
           ViewportCommands.toggleMute(ref, id).then((_) {
             if (!mounted) return;
@@ -243,7 +307,7 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
       } else if (event.logicalKey == LogicalKeyboardKey.equal ||
           event.logicalKey == LogicalKeyboardKey.minus ||
           event.logicalKey == LogicalKeyboardKey.digit0) {
-        final id = ref.read(activeProfileIdProvider);
+        final id = focusedActiveId(ref);
         if (id != null) {
           final key = event.logicalKey;
           final Future<double> result;
@@ -268,7 +332,7 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
         int index = event.logicalKey.keyId - LogicalKeyboardKey.digit1.keyId;
         final profiles = ref.read(profilesProvider);
         if (index < profiles.length) {
-          ref.read(activeProfileIdProvider.notifier).select(profiles[index].id);
+          selectIntoFocusedPane(ref, profiles[index].id);
         }
         return true;
       }
@@ -296,6 +360,8 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
         SessionStore.patch({'sidebarCollapsed': next}));
     ref.listen(isSidebarExpandedProvider, (_, next) =>
         SessionStore.patch({'sidebarExpanded': next}));
+    ref.listen(focusedPaneProvider, (_, next) =>
+        SessionStore.patch({'focusedPane': next}));
 
     final profiles = ref.watch(profilesProvider);
     final activeId = ref.watch(activeProfileIdProvider);
@@ -332,18 +398,25 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
                     VerticalDivider(thickness: 1, width: 1, color: scheme.onSurface.withValues(alpha: 0.1)),
                   Expanded(
                     flex: isSplitView ? (splitPosition * 100).toInt() : 100,
-                    child: IndexedStack(
-                      index: selectedIndex,
-                      children: profiles.map((profile) {
-                        return WebviewContainer(
-                          key: ValueKey('main_${profile.id}'),
-                          profileId: profile.id,
-                          initialUrl: profile.initialUrl,
-                          profileName: profile.name,
-                          customCSS: profile.customCSS,
-                          isBrowser: profile.isBrowser,
-                        );
-                      }).toList(),
+                    child: Column(
+                      children: [
+                        if (isSplitView) const PaneHeader(pane: 'main'),
+                        Expanded(
+                          child: IndexedStack(
+                            index: selectedIndex,
+                            children: profiles.map((profile) {
+                              return WebviewContainer(
+                                key: ValueKey('main_${profile.id}'),
+                                profileId: profile.id,
+                                initialUrl: profile.initialUrl,
+                                profileName: profile.name,
+                                customCSS: profile.customCSS,
+                                isBrowser: profile.isBrowser,
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                   if (isSplitView && selectedIndex2 != null)
@@ -361,19 +434,26 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
                   if (isSplitView && selectedIndex2 != null)
                     Expanded(
                       flex: ((1 - splitPosition) * 100).toInt(),
-                      child: IndexedStack(
-                        index: selectedIndex2,
-                        children: profiles.map((profile) {
-                          return WebviewContainer(
-                            key: ValueKey('split_${profile.id}'),
-                            profileId: profile.id,
-                            initialUrl: profile.initialUrl,
-                            profileName: profile.name,
-                            customCSS: profile.customCSS,
-                            isBrowser: profile.isBrowser,
-                            pane: 'split',
-                          );
-                        }).toList(),
+                      child: Column(
+                        children: [
+                          const PaneHeader(pane: 'split'),
+                          Expanded(
+                            child: IndexedStack(
+                              index: selectedIndex2,
+                              children: profiles.map((profile) {
+                                return WebviewContainer(
+                                  key: ValueKey('split_${profile.id}'),
+                                  profileId: profile.id,
+                                  initialUrl: profile.initialUrl,
+                                  profileName: profile.name,
+                                  customCSS: profile.customCSS,
+                                  isBrowser: profile.isBrowser,
+                                  pane: 'split',
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                 ],
