@@ -1,4 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:webview_all/webview_all.dart';
+
+import 'app_settings.dart';
 
 // 1. Data Models
 class AppProfile {
@@ -7,18 +10,23 @@ class AppProfile {
   final String initialUrl;
   final String? customCSS;
   final bool isBrowser;
+  final String? group; // config group header, e.g. "Personal (Google)"
 
   const AppProfile({
-    required this.id, 
-    required this.name, 
-    required this.initialUrl, 
+    required this.id,
+    required this.name,
+    required this.initialUrl,
     this.customCSS,
     this.isBrowser = false,
+    this.group,
   });
 }
 
 // Global initial profiles loaded from config.json before runApp
 List<AppProfile> initialProfiles = [];
+
+// Global initial settings loaded before runApp
+AppSettings initialSettings = AppSettings.defaults;
 
 // 2. Pre-defined Profiles State
 class ProfilesNotifier extends Notifier<List<AppProfile>> {
@@ -110,3 +118,40 @@ class SplitDividerPositionNotifier extends Notifier<double> {
   }
 }
 final splitDividerPositionProvider = NotifierProvider<SplitDividerPositionNotifier, double>(() => SplitDividerPositionNotifier());
+
+// 8. App Settings State (theme / accent / hibernation)
+class SettingsNotifier extends Notifier<AppSettings> {
+  @override
+  AppSettings build() => initialSettings;
+
+  Future<void> update(AppSettings next) async {
+    state = next;
+    await SettingsStore.save(next);
+  }
+
+  void patch(AppSettings Function(AppSettings) transform) {
+    update(transform(state));
+  }
+}
+final settingsProvider = NotifierProvider<SettingsNotifier, AppSettings>(
+    () => SettingsNotifier());
+
+// 9. Registered webview controllers so the toolbar can drive navigation of
+// the currently visible panes (keyed like "main_<profileId>" / "split_<id>").
+class WebviewControllersNotifier extends Notifier<Map<String, WebViewController>> {
+  @override
+  Map<String, WebViewController> build() => {};
+
+  void register(String key, WebViewController controller) {
+    state = {...state, key: controller};
+  }
+
+  void unregister(String key) {
+    if (!state.containsKey(key)) return;
+    final next = {...state}..remove(key);
+    state = next;
+  }
+}
+final webviewControllersProvider =
+    NotifierProvider<WebviewControllersNotifier, Map<String, WebViewController>>(
+        () => WebviewControllersNotifier());

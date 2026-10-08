@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:webview_all/webview_all.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,6 +13,7 @@ class WebviewContainer extends ConsumerStatefulWidget {
   final int profileIndex;
   final String? customCSS;
   final bool isBrowser;
+  final String pane; // 'main' or 'split' — registry key for toolbar control
 
   const WebviewContainer({
     super.key,
@@ -23,6 +23,7 @@ class WebviewContainer extends ConsumerStatefulWidget {
     required this.profileIndex,
     this.customCSS,
     this.isBrowser = false,
+    this.pane = 'main',
   });
 
   @override
@@ -35,7 +36,11 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   bool _isLoading = true;
   bool _isHibernating = false;
   bool _hasBeenInitialized = false;
+  bool _hasLoadError = false;
+  String _loadErrorMessage = '';
   Timer? _hibernationTimer;
+
+  String get _registryKey => '${widget.pane}_${widget.profileId}';
 
   @override
   void initState() {
@@ -48,12 +53,23 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     }
   }
 
+  @override
+  void dispose() {
+    _hibernationTimer?.cancel();
+    final registry = ref.read(webviewControllersProvider.notifier);
+    final key = _registryKey;
+    // Provider state must not be modified synchronously during dispose
+    Future.microtask(() => registry.unregister(key));
+    _urlController.dispose();
+    super.dispose();
+  }
+
   void _initializeWebview() {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0")
       ..setOnConsoleMessage((message) {
-        debugPrint('WebView Console: \${message.message}');
+        debugPrint('WebView Console: ${message.message}');
       })
       ..addJavaScriptChannel(
         'FlutterCommandPalette',
@@ -82,7 +98,23 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             }
           },
           onPageStarted: (String url) {
-            if (mounted) setState(() => _isLoading = true);
+            if (mounted) {
+              setState(() {
+                _isLoading = true;
+                _hasLoadError = false;
+                _loadErrorMessage = '';
+              });
+            }
+          },
+          onWebResourceError: (WebResourceError error) {
+            // Only surface main-frame failures (subresource 404s are normal)
+            if (error.isForMainFrame == true && mounted) {
+              setState(() {
+                _isLoading = false;
+                _hasLoadError = true;
+                _loadErrorMessage = error.description;
+              });
+            }
           },
           onNavigationRequest: (NavigationRequest request) async {
             // Let all links open natively inside the WebSpace app!
@@ -90,7 +122,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
           },
           onPageFinished: (String url) {
             if (mounted) {
-              setState(() => _isLoading = false);
+              setState(() {
+                _isLoading = false;
+                _hasLoadError = false;
+              });
               if (widget.isBrowser) {
                 _urlController.text = url;
               }
@@ -161,6 +196,19 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
         ),
       )
       ..loadRequest(Uri.parse(widget.initialUrl));
+
+    // Expose the controller to the toolbar (back / forward / reload).
+    // Deferred: initState runs during build, where provider writes throw.
+    final registry = ref.read(webviewControllersProvider.notifier);
+    final key = _registryKey;
+    final controller = _controller;
+    Future.microtask(() {
+      if (mounted) {
+        registry.register(key, controller);
+      } else {
+        registry.unregister(key);
+      }
+    });
   }
 
   void _checkHibernation() {
@@ -169,10 +217,14 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     final isActive = activeIndex == widget.profileIndex || activeIndex2 == widget.profileIndex;
 
     if (!isActive) {
-      // Start hibernation timer if not active (20 minutes)
-      if (_hasBeenInitialized) {
-        _hibernationTimer ??= Timer(const Duration(minutes: 20), () {
+      // Start hibernation timer if not active (timeout from settings; 0 = never)
+      final minutes = ref.read(settingsProvider).hibernateMinutes;
+      if (_hasBeenInitialized && minutes > 0) {
+        _hibernationTimer ??= Timer(Duration(minutes: minutes), () {
           if (mounted) {
+            ref
+                .read(webviewControllersProvider.notifier)
+                .unregister(_registryKey);
             setState(() {
               _isHibernating = true;
             });
@@ -202,12 +254,57 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
 
   @override
   Widget build(BuildContext context) {
-    // Listen to active index changes
+    // Listen to active index changes in BOTH panes so split-pane switches
+    // also wake / initialize the selected webview.
     ref.listen(activeProfileIndexProvider, (previous, next) {
+      _checkHibernation();
+    });
+    ref.listen(activeProfileIndex2Provider, (previous, next) {
       _checkHibernation();
     });
 
     final isCommandPaletteOpen = ref.watch(isCommandPaletteOpenProvider);
+
+    if (_hasLoadError) {
+      return Container(
+        color: Theme.of(context).colorScheme.surface,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off, size: 64, color: Colors.grey),
+              const SizedBox(height: 16),
+              Text(widget.profileName,
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Text(
+                  _loadErrorMessage.isEmpty
+                      ? 'Could not load this page'
+                      : _loadErrorMessage,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.grey, fontSize: 13),
+                ),
+              ),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                onPressed: () {
+                  setState(() {
+                    _hasLoadError = false;
+                    _isLoading = true;
+                  });
+                  _controller.reload();
+                },
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
     if (_isHibernating) {
       return Container(

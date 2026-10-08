@@ -44,6 +44,7 @@ dependencies:
   path: ^1.9.1
   tray_manager: ^0.7.0
   local_notifier: ^0.1.6
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:
