@@ -1,54 +1,54 @@
 {
-    "Personal (Google)": [
-        {
-            "name": "Gmail",
-            "url": "https://mail.google.com/mail/u/0/"
-        },
-        {
-            "name": "Calendar",
-            "url": "https://calendar.google.com/"
-        },
-        {
-            "name": "Drive",
-            "url": "https://drive.google.com/"
-        },
-        {
-            "name": "Meet",
-            "url": "https://meet.google.com/"
-        },
-        {
-            "name": "YouTube",
-            "url": "https://www.youtube.com/"
-        },
-        {
-            "name": "Overleaf",
-            "url": "https://www.overleaf.com/"
-        },
-        {
-            "name": "Facebook",
-            "url": "https://www.facebook.com/"
-        },
-        {
-            "name": "WhatsApp",
-            "url": "https://web.whatsapp.com/"
-        }
-    ],
-    "Work (Microsoft)": [
-        {
-            "name": "Outlook",
-            "url": "https://outlook.office.com/mail/"
-        },
-        {
-            "name": "Teams",
-            "url": "https://teams.microsoft.com/"
-        },
-        {
-            "name": "Calendar",
-            "url": "https://outlook.office.com/calendar/"
-        },
-        {
-            "name": "OneDrive",
-            "url": "https://www.office.com/launch/onedrive/"
-        }
-    ]
+  "Personal (Google)": [
+    {
+      "name": "Gmail",
+      "url": "https://mail.google.com/mail/u/0/"
+    },
+    {
+      "name": "Calendar",
+      "url": "https://calendar.google.com/"
+    },
+    {
+      "name": "Drive",
+      "url": "https://drive.google.com/"
+    },
+    {
+      "name": "Meet",
+      "url": "https://meet.google.com/"
+    },
+    {
+      "name": "YouTube",
+      "url": "https://www.youtube.com/"
+    },
+    {
+      "name": "Overleaf",
+      "url": "https://www.overleaf.com/"
+    },
+    {
+      "name": "Facebook",
+      "url": "https://www.facebook.com/"
+    },
+    {
+      "name": "WhatsApp",
+      "url": "https://web.whatsapp.com/"
+    }
+  ],
+  "Work (Microsoft)": [
+    {
+      "name": "Outlook",
+      "url": "https://outlook.office.com/mail/"
+    },
+    {
+      "name": "Teams",
+      "url": "https://teams.microsoft.com/v2/"
+    },
+    {
+      "name": "Calendar",
+      "url": "https://outlook.office.com/calendar/"
+    },
+    {
+      "name": "OneDrive",
+      "url": "https://www.office.com/launch/onedrive/"
+    }
+  ]
 }

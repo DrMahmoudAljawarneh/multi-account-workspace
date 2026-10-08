@@ -165,6 +165,12 @@ Future<void> _initTray() async {
     menu?.addItem(separator);
     menu?.addItem(exitItem);
     tray.setContextMenu(menu);
+    // Advertise the menu to the StatusNotifier host: the native backend
+    // only exposes the Menu object path when the trigger is Clicked
+    // (RightClicked etc. keep it hidden). On Linux SNI the host still
+    // opens it on right-click; left-click keeps firing Activated, which
+    // our listener uses to show the window.
+    tray.setContextMenuTrigger(nativeapi.ContextMenuTrigger.clicked);
     // Retain everything the native side owns through these handles.
     _trayHandles.addAll([menu, showItem, separator, exitItem]);
 
