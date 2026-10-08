@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/app_settings.dart';
+import '../../core/app_version.dart';
 import '../../core/config_manager.dart';
 import '../../core/providers.dart';
 import '../widgets/confirm_dialog.dart';
@@ -694,6 +695,11 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
                     )
                   else
                     const Spacer(),
+                  Text('WebSpace v$kAppVersion',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: scheme.onSurfaceVariant)),
                   TextButton(
                     onPressed: _requestClose,
                     child: const Text('Cancel'),

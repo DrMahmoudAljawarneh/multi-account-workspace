@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:local_notifier/local_notifier.dart';
 import '../../core/providers.dart';
+import '../../core/overlay_gate.dart';
 import '../../core/host_match.dart';
 import '../../core/session_store.dart';
 import '../../core/vault_service.dart';
@@ -356,10 +357,7 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
             ? ViewportCommands.zoomIn(ref, widget.profileId)
             : ViewportCommands.zoomOut(ref, widget.profileId));
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('${(next * 100).round()}%'),
-        duration: const Duration(seconds: 1),
-      ));
+      showTransientNotice(context, ref, '${(next * 100).round()}%');
     }
   }
 
@@ -463,30 +461,44 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     }
     final isUpdate = existing != null;
     final host = Uri.tryParse(_lastUrl)?.host ?? '';
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.showSnackBar(SnackBar(
-      content: Text(isUpdate
-          ? 'Update saved password for ${widget.profileName}?'
-          : 'Save password for ${widget.profileName}?'),
-      duration: const Duration(seconds: 8),
-      action: SnackBarAction(
-        label: isUpdate ? 'Update' : 'Save',
-        onPressed: () async {
-          final ok = await VaultService.save(
-            appName: widget.profileName,
-            username: user,
-            password: pass,
-            domain: host,
-          );
-          messenger.showSnackBar(SnackBar(
-            content: Text(ok
-                ? 'Password saved for ${widget.profileName}'
-                : 'Could not reach the system keyring'),
-            duration: const Duration(seconds: 2),
-          ));
-        },
+    // A modal dialog (not a snackbar): snackbars with actions would need the
+    // webview overlay hidden for their whole lifetime, while a dialog fits
+    // the overlay gate and matches browser save-password prompts.
+    final save = await showAppDialog<bool>(
+      context,
+      ref,
+      (dialogContext) => AlertDialog(
+        title: Text(isUpdate ? 'Update saved password?' : 'Save password?'),
+        content: Text(
+            '${widget.profileName}\n$user\n$host\n\nThe password is stored in the system keyring.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(isUpdate ? 'Update' : 'Save'),
+          ),
+        ],
       ),
-    ));
+    );
+    if (save != true || !mounted) return;
+    final ok = await VaultService.save(
+      appName: widget.profileName,
+      username: user,
+      password: pass,
+      domain: host,
+    );
+    if (!mounted) return;
+    await showTransientNotice(
+      context,
+      ref,
+      ok
+          ? 'Password saved for ${widget.profileName}'
+          : 'Could not reach the system keyring',
+      duration: const Duration(seconds: 2),
+    );
   }
 
   /// Camera / microphone requests — the Linux plugin denies them outright
@@ -497,9 +509,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
       await request.deny();
       return;
     }
-    final granted = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
+    final granted = await showAppDialog<bool>(
+      context,
+      ref,
+      (context) => AlertDialog(
         title: const Text('Allow device access?'),
         content: Text(
             '"$_pageHost" wants to use your $wanted.'),
@@ -525,9 +538,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   /// JS alert() — surfaces the message instead of silently auto-confirming.
   Future<void> _showJsAlert(String message, String url) async {
     if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
+    await showAppDialog<void>(
+      context,
+      ref,
+      (context) => AlertDialog(
         title: Text(_hostOf(url),
             style: const TextStyle(fontSize: 14)),
         content: Text(message),
@@ -544,9 +558,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   /// JS confirm() — returns the user's choice to the page.
   Future<bool> _showJsConfirm(String message, String url) async {
     if (!mounted) return false;
-    return await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
+    return await showAppDialog<bool>(
+          context,
+          ref,
+          (context) => AlertDialog(
             title: Text(_hostOf(url),
                 style: const TextStyle(fontSize: 14)),
             content: Text(message),
@@ -571,9 +586,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
       String message, String url, String defaultValue) async {
     if (!mounted) return defaultValue;
     final ctrl = TextEditingController(text: defaultValue);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
+    final result = await showAppDialog<String>(
+      context,
+      ref,
+      (context) => AlertDialog(
         title: Text(_hostOf(url), style: const TextStyle(fontSize: 14)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -656,6 +672,15 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     });
 
     final isCommandPaletteOpen = ref.watch(isCommandPaletteOpenProvider);
+    // Native GTK overlays paint above ALL Flutter pixels, so a pane hides
+    // its overlay while any Flutter UI covers it: palette / modal dialogs /
+    // find bar / transient toasts — and whenever it is not the selected
+    // IndexedStack child (RenderIndexedStack doesn't override paintsChild,
+    // so the plugin cannot detect the hidden child itself).
+    final flutterOverlayOpen = isCommandPaletteOpen ||
+        ref.watch(isAppDialogOpenProvider) ||
+        ref.watch(isFindOpenProvider) ||
+        ref.watch(isTransientNoticeOpenProvider);
     // Which provider decides *this* pane's selection.
     final paneActiveId = widget.pane == 'split'
         ? ref.watch(activeProfileId2Provider)
@@ -737,12 +762,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     return Stack(
       children: [
         Offstage(
-          // Hide the native GTK overlay while the palette is open (Flutter
-          // dialogs must paint above it) AND whenever this pane is not the
-          // selected IndexedStack child: RenderIndexedStack doesn't override
-          // paintsChild, so the plugin cannot detect the hidden child and
-          // would otherwise keep the overlay painted over the selected app.
-          offstage: isCommandPaletteOpen ||
+          // Hide the native GTK overlay while Flutter UI covers it (palette,
+          // dialogs, find bar, toasts) and whenever this pane is not the
+          // selected IndexedStack child.
+          offstage: flutterOverlayOpen ||
               paneActiveId != widget.profileId,
           child: Column(
             children: [

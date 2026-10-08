@@ -12,6 +12,7 @@ import 'package:tray_manager/tray_manager.dart' as nativeapi;
 import 'package:local_notifier/local_notifier.dart';
 import 'core/app_settings.dart';
 import 'core/providers.dart';
+import 'core/overlay_gate.dart';
 import 'core/config_manager.dart';
 import 'core/session_store.dart';
 import 'core/viewport.dart';
@@ -310,10 +311,8 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
             if (!mounted) return;
             final muted =
                 ref.read(mutedAppsProvider.notifier).isMuted(id);
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text(muted ? 'Audio muted' : 'Audio unmuted'),
-              duration: const Duration(seconds: 1),
-            ));
+            showTransientNotice(
+                context, ref, muted ? 'Audio muted' : 'Audio unmuted');
           });
         }
         return true;
@@ -333,10 +332,7 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
           }
           result.then((next) {
             if (!mounted) return;
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('${(next * 100).round()}%'),
-              duration: const Duration(seconds: 1),
-            ));
+            showTransientNotice(context, ref, '${(next * 100).round()}%');
           });
         }
         return true;

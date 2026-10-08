@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers.dart';
+import '../../core/overlay_gate.dart';
 import '../../core/viewport.dart';
 import '../settings/settings_dialog.dart';
 import '../vault/vault_dialog.dart';
@@ -148,17 +149,19 @@ class AppToolbar extends ConsumerWidget {
           iconButton(
             icon: Icons.key,
             tooltip: 'Credential vault',
-            onPressed: () => showDialog(
-              context: context,
-              builder: (_) => const VaultDialog(),
+            onPressed: () => showAppDialog(
+              context,
+              ref,
+              (_) => const VaultDialog(),
             ),
           ),
           iconButton(
             icon: Icons.settings,
             tooltip: 'Settings',
-            onPressed: () => showDialog(
-              context: context,
-              builder: (_) => const SettingsDialog(),
+            onPressed: () => showAppDialog(
+              context,
+              ref,
+              (_) => const SettingsDialog(),
             ),
           ),
           const SizedBox(width: 8),

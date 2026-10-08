@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers.dart';
+import '../../core/overlay_gate.dart';
 import '../../core/viewport.dart';
 import '../settings/settings_dialog.dart';
 import '../vault/vault_dialog.dart';
@@ -31,15 +32,15 @@ void showCommandPalette(BuildContext context, WidgetRef ref) {
               title: 'Settings…',
               subtitle: 'Appearance, profiles & apps, advanced JSON',
               icon: Icons.settings_outlined,
-              run: () => showDialog(
-                  context: appContext, builder: (_) => const SettingsDialog()),
+              run: () => showAppDialog(
+                  appContext, ref, (_) => const SettingsDialog()),
             ),
             (
               title: 'Credential vault…',
               subtitle: 'Reveal, copy or update stored passwords',
               icon: Icons.key_outlined,
-              run: () => showDialog(
-                  context: appContext, builder: (_) => const VaultDialog()),
+              run: () => showAppDialog(
+                  appContext, ref, (_) => const VaultDialog()),
             ),
             (
               title: 'Find in page…',
