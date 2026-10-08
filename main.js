@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, dialog, shell, Tray, Menu, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, session, dialog, shell, Tray, Menu, nativeImage, Notification, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -11,41 +11,36 @@ app.commandLine.appendSwitch('disable-gpu'); // Safe fallback for Asahi/mesa sof
 // Hide automation fingerprint that Google's sign-in risk engine checks
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 // Disable Client Hints so Google JS cannot read the real "Electron" brand via navigator.userAgentData
-app.commandLine.appendSwitch('disable-features', 'UserAgentClientHint');
+// Disable WebAuthentication completely so Microsoft's iframes cannot access FIDO2
+app.commandLine.appendSwitch('disable-features', 'UserAgentClientHint,WebAuthentication');
 
 // --- Google Sign-In & Bot-Detection Bypass ------------------------------------
 const FIREFOX_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0';
-app.userAgentFallback = FIREFOX_UA;
+const LINUX_CHROME_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-const AUTH_HOSTS = [
-    'accounts.google.com',
-    'accounts.youtube.com',
-    'myaccount.google.com',
-    'login.microsoftonline.com',
-    'login.live.com',
-    'appleid.apple.com'
-];
-function isAuthUrl(url) {
-    try {
-        const { protocol, hostname } = new URL(url);
-        return protocol === 'https:' && AUTH_HOSTS.some(h => hostname === h || hostname.endsWith('.' + h));
-    } catch (e) {
-        return false;
-    }
-}
+app.userAgentFallback = LINUX_CHROME_UA;
 
 function hardenSession(ses) {
     ses.setUserAgent(FIREFOX_UA);
     ses.webRequest.onBeforeSendHeaders((details, callback) => {
         const headers = details.requestHeaders;
-        headers['User-Agent'] = FIREFOX_UA;
-        // Strip out all Client Hints so Google doesn't detect Chromium mismatch
-        for (const key of Object.keys(headers)) {
-            const lower = key.toLowerCase();
-            if (lower.startsWith('sec-ch-ua')) {
-                delete headers[key];
-            }
+        const url = details.url;
+        
+        // If it's a login page, we masquerade as an iPad.
+        // Mobile devices do not use USB Security Keys (WebAuthn) in the same way,
+        // so Microsoft gracefully falls back to sending an Authenticator Push Notification
+        // or asking for a Password, completely eliminating the FIDO2 hang in Electron!
+        if (url.includes('login.microsoft') || url.includes('login.live.com')) {
+            headers['User-Agent'] = 'Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
+        } else {
+            headers['User-Agent'] = FIREFOX_UA;
         }
+
+        // Unconditionally strip out all Client Hints so no provider detects Electron
+        for (const key of Object.keys(headers)) {
+            if (key.toLowerCase().startsWith('sec-ch-ua')) delete headers[key];
+        }
+        
         callback({ requestHeaders: headers });
     });
 }
@@ -126,6 +121,10 @@ ipcMain.on('save-config', (event, newConfig) => {
     fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 4));
 });
 
+ipcMain.handle('get-preload-path', () => {
+    return 'file://' + path.join(__dirname, 'webview-preload.js');
+});
+
 ipcMain.on('update-badge', (event, count) => {
     if (app.setBadgeCount) app.setBadgeCount(count);
     if (tray) tray.setToolTip(count > 0 ? `WebSpace (${count} unread)` : 'WebSpace');
@@ -165,23 +164,26 @@ ipcMain.on('setup-partition', (event, partitionName) => {
         });
         callback(choice === 0);
     });
+
+    // Actively reject native WebAuthn/FIDO2 prompts so they don't hang the UI and force Microsoft to fallback.
+    ses.on('select-webauthn-account', (event, details, callback) => {
+        event.preventDefault();
+        callback(); // Cancels the request
+    });
 });
 
 app.on('web-contents-created', (event, contents) => {
     contents.setWindowOpenHandler(({ url }) => {
-        // Allow all popups to open as new windows inside the Electron app natively.
-        // This stops them from escaping to the system browser and ensures they
-        // inherit the session and headers of the parent window.
-        return {
+        // Allow all popups to open as new windows natively.
+        // We MUST inject the preload script into the popup so that Microsoft
+        // cannot access WebAuthn or Electron APIs in the new window!
+        return { 
             action: 'allow',
             overrideBrowserWindowOptions: {
-                parent: mainWindow,
-                autoHideMenuBar: true,
                 webPreferences: {
+                    preload: path.join(__dirname, 'webview-preload.js'),
                     nodeIntegration: false,
-                    contextIsolation: true,
-                    sandbox: true,
-                    preload: path.join(__dirname, 'webview-preload.js')
+                    contextIsolation: true
                 }
             }
         };
@@ -192,3 +194,47 @@ app.on('web-contents-created', (event, contents) => {
         if (!/^https?:|^about:blank/.test(url) && contents.getType() === 'webview') e.preventDefault();
     });
 });
+
+// --- Credential Vault Handlers ---
+const getCredentialsPath = () => path.join(app.getPath('userData'), 'vault.json');
+
+ipcMain.handle('save-credential', async (event, { appName, username, password }) => {
+    if (!safeStorage.isEncryptionAvailable()) {
+        return { success: false, error: 'OS Encryption not available on this system' };
+    }
+    
+    try {
+        const encryptedPassword = safeStorage.encryptString(password).toString('base64');
+        const vaultPath = getCredentialsPath();
+        
+        let vault = {};
+        if (fs.existsSync(vaultPath)) {
+            vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+        }
+        
+        vault[appName] = { username, password: encryptedPassword };
+        fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+        
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('get-credential', async (event, appName) => {
+    try {
+        const vaultPath = getCredentialsPath();
+        if (!fs.existsSync(vaultPath)) return null;
+        
+        const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+        if (!vault[appName]) return null;
+        
+        const encryptedBuffer = Buffer.from(vault[appName].password, 'base64');
+        const decryptedPassword = safeStorage.decryptString(encryptedBuffer);
+        
+        return { username: vault[appName].username, password: decryptedPassword };
+    } catch (e) {
+        return null; // Silent fail on decryption errors
+    }
+});
+// ---------------------------------

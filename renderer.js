@@ -69,15 +69,51 @@ function mountWebview(appObj) {
         // Partition must be set before src (first navigation locks the session)
         wv.setAttribute('partition', `persist:${appObj.profileName}`);
         wv.setAttribute('allowpopups', ''); // required for "Sign in with Google" popups
-        // 100% Solution: We must also override the DOM UA, otherwise navigator.userAgent 
-        // exposes "Electron" to Google's JavaScript engine inside the webview!
-        wv.setAttribute('useragent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0');
+        // The dynamic User-Agent swapping is now handled entirely via main.js and webview-preload.js
         wv.style.display = 'none';
         window.api.setupPartition(wv.partition);
         wv.setAttribute('src', appObj.app.url);
         
-        wv.addEventListener('dom-ready', () => {
+        wv.addEventListener('dom-ready', async () => {
             if (appObj.app.customCSS) wv.insertCSS(appObj.app.customCSS);
+            
+            // Auto-Login Script Injection
+            if (window.api.getCredential) {
+                const cred = await window.api.getCredential(appObj.app.name);
+                if (cred && cred.username && cred.password) {
+                    const injectionScript = `
+                        (function() {
+                            const tryFill = () => {
+                                const emailInput = document.querySelector('input[type="email"], input[name="loginfmt"], input[name="identifier"]');
+                                const passInput = document.querySelector('input[type="password"]');
+                                let filled = false;
+                                
+                                if (emailInput && !emailInput.value) {
+                                    emailInput.value = '${cred.username}';
+                                    emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+                                    filled = true;
+                                }
+                                if (passInput && !passInput.value) {
+                                    passInput.value = '${cred.password}';
+                                    passInput.dispatchEvent(new Event('input', { bubbles: true }));
+                                    filled = true;
+                                }
+                                return filled;
+                            };
+                            
+                            // Try multiple times as SPAs load elements asynchronously
+                            const interval = setInterval(() => {
+                                if (tryFill()) {
+                                    console.log('WebSpace: Auto-filled credentials from Secure Vault');
+                                    clearInterval(interval);
+                                }
+                            }, 500);
+                            setTimeout(() => clearInterval(interval), 10000); // Give up after 10s
+                        })();
+                    `;
+                    wv.executeJavaScript(injectionScript).catch(e => console.error('Auto-fill error:', e));
+                }
+            }
         });
         
         wv.addEventListener('did-start-loading', () => {
@@ -93,8 +129,13 @@ function mountWebview(appObj) {
             }
         });
         
-        appObj.wv = wv;
-        leftStack.appendChild(wv);
+        
+        // Wait for preload path asynchronously
+        window.api.getWebviewPreloadPath().then(path => {
+            wv.setAttribute('preload', path);
+            appObj.wv = wv;
+            leftStack.appendChild(wv);
+        });
     }
     appObj.lastAccessed = Date.now();
     return appObj.wv;
@@ -251,6 +292,50 @@ window.addEventListener('keydown', (e) => {
     }
     if (e.ctrlKey && e.key.toLowerCase() === 'b') document.getElementById('btn-toggle-sidebar').click();
     if (e.ctrlKey && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
+});
+
+// Vault Modal Interactions
+const btnVault = document.getElementById('btn-vault');
+const vaultModal = document.getElementById('vault-modal');
+const btnCancelVault = document.getElementById('btn-cancel-vault');
+const btnSaveVault = document.getElementById('btn-save-vault');
+
+btnVault.addEventListener('click', () => {
+    vaultModal.classList.add('show');
+    if (activeApp) document.getElementById('vault-appname').value = activeApp.app.name;
+    document.getElementById('vault-username').value = '';
+    document.getElementById('vault-password').value = '';
+    document.getElementById('vault-username').focus();
+});
+
+btnCancelVault.addEventListener('click', () => vaultModal.classList.remove('show'));
+btnSaveVault.addEventListener('click', async () => {
+    const appName = document.getElementById('vault-appname').value.trim();
+    const username = document.getElementById('vault-username').value.trim();
+    const password = document.getElementById('vault-password').value.trim();
+    
+    if (!appName || !username || !password) {
+        showToast('Please fill all fields', '⚠️');
+        return;
+    }
+    
+    btnSaveVault.textContent = 'Encrypting...';
+    btnSaveVault.disabled = true;
+    
+    try {
+        const res = await window.api.saveCredential({ appName, username, password });
+        if (res.success) {
+            showToast(`Credentials saved securely for ${appName}`, '🔒');
+            vaultModal.classList.remove('show');
+        } else {
+            showToast('Encryption failed: ' + res.error, '❌');
+        }
+    } catch (e) {
+        showToast('Save failed: ' + e.message, '❌');
+    }
+    
+    btnSaveVault.textContent = 'Save to OS Keychain';
+    btnSaveVault.disabled = false;
 });
 
 // Toolbar buttons
