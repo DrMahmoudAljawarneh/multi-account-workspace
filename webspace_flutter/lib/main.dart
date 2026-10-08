@@ -133,14 +133,20 @@ Color _accentFromHex(String hex) {
   }
 }
 
-// Tray icon/menu handles are captured by their event-listener closures for
-// the lifetime of the process.
+// Native handles retained for the lifetime of the process. The native
+// binding attaches a finalizer that destroys the tray icon (and
+// unregisters it from the StatusNotifier watcher) as soon as its Dart
+// object is garbage-collected — keeping them in locals inside _initTray
+// killed the tray silently right after startup.
+final List<Object?> _trayHandles = [];
+
 Future<void> _initTray() async {
   try {
     final tray = nativeapi.TrayIcon.create();
     if (tray == null) return;
     final icon = nativeapi.ImageAsset.fromAsset('assets/icon.png') ??
         nativeapi.Image.fromFile('assets/icon.png');
+    _trayHandles.addAll([tray, icon]);
     tray
       ..icon = icon
       ..isIconTemplate = false
@@ -153,11 +159,14 @@ Future<void> _initTray() async {
         'Show WebSpace', nativeapi.MenuItemType.normal);
     final exitItem = nativeapi.MenuItem.createWithLabelAndType(
         'Exit', nativeapi.MenuItemType.normal);
+    final separator = nativeapi.MenuItem.createWithLabelAndType(
+        '', nativeapi.MenuItemType.separator);
     menu?.addItem(showItem);
-    menu?.addItem(nativeapi.MenuItem.createWithLabelAndType(
-        '', nativeapi.MenuItemType.separator));
+    menu?.addItem(separator);
     menu?.addItem(exitItem);
     tray.setContextMenu(menu);
+    // Retain everything the native side owns through these handles.
+    _trayHandles.addAll([menu, showItem, separator, exitItem]);
 
     // Left-click on the tray icon → show the window
     tray.addListener((event) {
