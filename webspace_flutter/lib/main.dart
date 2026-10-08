@@ -33,7 +33,11 @@ void main() async {
   // healing any ids that no longer exist in the profile list.
   initialSession =
       SessionStore.load().validate(initialProfiles.map((p) => p.id).toSet());
-  
+  // Persist the healed state right away: without this, activeAppId only
+  // reached disk if the user changed something, so a no-interaction run
+  // left the file without a selection to restore next time.
+  await SessionStore.save(initialSession);
+
   // Initialize the tray icon through tray_manager's native API
   await _initTray();
   

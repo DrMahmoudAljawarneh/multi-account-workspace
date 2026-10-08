@@ -76,7 +76,8 @@ class SessionData {
     return SessionData(
       activeAppId: activeId,
       activeAppId2: activeId2,
-      splitView: splitView,
+      // Split view without a surviving second app has nothing to show.
+      splitView: splitView && activeId2 != null,
       // A remembered split-pane focus is only meaningful while split is on
       // (and while a second pane actually exists).
       focusedPane: (splitView && activeId2 != null && focusedPane == 'split')
@@ -151,8 +152,26 @@ class SessionStore {
     return const SessionData();
   }
 
-  /// Full overwrite (atomic: temp file + rename).
-  static Future<void> save(SessionData session, {File? toFile}) async {
+  /// Every write runs through one FIFO queue. patch/setUrl/… are
+  /// load → merge → save cycles; without serialization two overlapping
+  /// cycles interleave and the later save silently reverts the earlier
+  /// one's keys (observed: splitView reverted and activeAppId never
+  /// persisted while a racing setUrl won the file).
+  static Future<void> _queue = Future<void>.value();
+
+  static Future<void> _enqueue(Future<void> Function() job) {
+    final run = _queue.then((_) => job());
+    // The chain itself must never reject; job errors still reach the caller.
+    _queue = run.catchError((_) {});
+    return run;
+  }
+
+  /// Full overwrite (atomic: temp file + rename), serialized with all
+  /// other writers.
+  static Future<void> save(SessionData session, {File? toFile}) =>
+      _enqueue(() => _saveNow(session, toFile: toFile));
+
+  static Future<void> _saveNow(SessionData session, {File? toFile}) async {
     try {
       final f = file(toFile: toFile);
       f.parent.createSync(recursive: true);
@@ -161,15 +180,16 @@ class SessionStore {
     } catch (_) {}
   }
 
-  /// Load → apply [patch] → write. Single-isolate, so read-modify-write is
-  /// safe enough for this small file.
-  static Future<void> patch(Map<String, dynamic> patch, {File? toFile}) async {
-    try {
-      final current = load(toFile: toFile);
-      final merged = current.toJson()..addAll(patch);
-      await save(SessionData.fromJson(merged), toFile: toFile);
-    } catch (_) {}
-  }
+  /// Load → apply [patch] → write, serialized behind any in-flight write so
+  /// concurrent patches can't drop each other's keys.
+  static Future<void> patch(Map<String, dynamic> patch, {File? toFile}) =>
+      _enqueue(() async {
+        try {
+          final current = load(toFile: toFile);
+          final merged = current.toJson()..addAll(patch);
+          await _saveNow(SessionData.fromJson(merged), toFile: toFile);
+        } catch (_) {}
+      });
 
   /// Merge helpers for the per-app maps (patch would replace them wholesale).
   static Future<void> setUrl(String profileId, String url, {File? toFile}) =>
@@ -182,16 +202,17 @@ class SessionStore {
       _patchMap('muted', {profileId: muted}, toFile: toFile);
 
   static Future<void> _patchMap(String key, Map<String, dynamic> delta,
-      {File? toFile}) async {
-    try {
-      final current = load(toFile: toFile).toJson();
-      final existing = current[key];
-      final merged = <String, dynamic>{
-        if (existing is Map) ...existing,
-        ...delta,
-      };
-      current[key] = merged;
-      await save(SessionData.fromJson(current), toFile: toFile);
-    } catch (_) {}
-  }
+          {File? toFile}) =>
+      _enqueue(() async {
+        try {
+          final current = load(toFile: toFile).toJson();
+          final existing = current[key];
+          final merged = <String, dynamic>{
+            if (existing is Map) ...existing,
+            ...delta,
+          };
+          current[key] = merged;
+          await _saveNow(SessionData.fromJson(current), toFile: toFile);
+        } catch (_) {}
+      });
 }

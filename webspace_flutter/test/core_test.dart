@@ -165,7 +165,8 @@ void main() {
       expect(v.activeAppId2, isNull);
       // Focus can't point at a pane that no longer exists
       expect(v.focusedPane, 'main');
-      expect(v.splitView, isTrue);
+      // …and neither can the split view itself
+      expect(v.splitView, isFalse);
       expect(v.urls.keys, ['kept']);
       expect(v.zoom.keys, isEmpty);
       expect(v.muted['kept'], isTrue);

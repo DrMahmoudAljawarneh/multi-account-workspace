@@ -49,11 +49,17 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
 
   String get _registryKey => '${widget.pane}_${widget.profileId}';
 
-  /// True when this profile is the active app in either pane (by stable id).
+  /// True when this profile is the active app **in this container's own
+  /// pane** (by stable id). The main pane must not wake for `activeId2`:
+  /// that would spin up a duplicate webview — and native GTK overlay — for
+  /// the split pane's app, painted over the main pane (RenderIndexedStack
+  /// never overrides `paintsChild`, so webview_all_linux can't tell a
+  /// non-selected IndexedStack child is hidden).
   bool get _isActive {
-    final activeId = ref.read(activeProfileIdProvider);
-    final activeId2 = ref.read(activeProfileId2Provider);
-    return activeId == widget.profileId || activeId2 == widget.profileId;
+    if (widget.pane == 'split') {
+      return ref.read(activeProfileId2Provider) == widget.profileId;
+    }
+    return ref.read(activeProfileIdProvider) == widget.profileId;
   }
 
   @override
@@ -640,7 +646,8 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
   @override
   Widget build(BuildContext context) {
     // Listen to active selection changes in BOTH panes so split-pane switches
-    // also wake / initialize the selected webview.
+    // also wake / initialize the selected webview. (Which one *this* container
+    // responds to is scoped by _isActive to its own pane.)
     ref.listen(activeProfileIdProvider, (previous, next) {
       _checkHibernation();
     });
@@ -649,6 +656,10 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     });
 
     final isCommandPaletteOpen = ref.watch(isCommandPaletteOpenProvider);
+    // Which provider decides *this* pane's selection.
+    final paneActiveId = widget.pane == 'split'
+        ? ref.watch(activeProfileId2Provider)
+        : ref.watch(activeProfileIdProvider);
 
     if (_hasLoadError) {
       return Container(
@@ -726,7 +737,13 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     return Stack(
       children: [
         Offstage(
-          offstage: isCommandPaletteOpen,
+          // Hide the native GTK overlay while the palette is open (Flutter
+          // dialogs must paint above it) AND whenever this pane is not the
+          // selected IndexedStack child: RenderIndexedStack doesn't override
+          // paintsChild, so the plugin cannot detect the hidden child and
+          // would otherwise keep the overlay painted over the selected app.
+          offstage: isCommandPaletteOpen ||
+              paneActiveId != widget.profileId,
           child: Column(
             children: [
               if (widget.isBrowser)

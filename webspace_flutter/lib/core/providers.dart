@@ -180,9 +180,12 @@ class SplitViewNotifier extends Notifier<bool> {
 
   void toggle() {
     state = !state;
-    // Split pane focus is meaningless without the split pane
+    // Split pane focus is meaningless without the split pane, and a stale
+    // activeId2 would keep main-pane containers awake for an app that is no
+    // longer shown in either pane (and linger in the session file).
     if (!state) {
       ref.read(focusedPaneProvider.notifier).set('main');
+      ref.read(activeProfileId2Provider.notifier).select(null);
     }
   }
 }
