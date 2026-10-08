@@ -10,7 +10,13 @@ contextBridge.exposeInMainWorld('api', {
     minimizeWindow: () => ipcRenderer.send('window-minimize'),
     maximizeWindow: () => ipcRenderer.send('window-maximize'),
     closeWindow: () => ipcRenderer.send('window-close'),
-    
+
+    // Global shortcuts intercepted by main process (work while webviews are focused)
+    onGlobalShortcut: (cb) => ipcRenderer.on('global-shortcut', (_event, cmd) => cb(cmd)),
+
+    // Local cached favicon lookup (no third-party tracking)
+    getFavicon: (domain) => ipcRenderer.invoke('get-favicon', domain),
+
     // Credential Vault
     saveCredential: (data) => ipcRenderer.invoke('save-credential', data),
     getCredential: (appName) => ipcRenderer.invoke('get-credential', appName)

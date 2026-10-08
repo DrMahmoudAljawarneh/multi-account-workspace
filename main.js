@@ -50,6 +50,42 @@ app.on('session-created', hardenSession);
 let mainWindow;
 let tray;
 
+// --- Global Shortcuts -------------------------------------------------------
+// Key events inside <webview> guests never reach the renderer, so chrome
+// shortcuts (Ctrl+K / Ctrl+B / Ctrl+1-9) are intercepted here in the main
+// process and forwarded to the renderer over IPC.
+let lastChord = { cmd: null, at: 0 };
+
+function handleGlobalShortcut(event, input) {
+    if (input.type !== 'keyDown') return;
+    if (!input.control && !input.meta) return;
+
+    const key = input.key.toLowerCase();
+    let cmd = null;
+
+    if (key === 'k') cmd = 'palette';
+    else if (key === 'b') cmd = 'toggle-sidebar';
+    else if (key === 'f') cmd = 'find';
+    else if (key === 's' && input.shift) cmd = 'toggle-split';
+    else if (key >= '1' && key <= '9') cmd = 'app:' + key;
+
+    if (cmd) {
+        event.preventDefault(); // Stop the guest page from also receiving the chord
+
+        // When a webview guest has focus, BOTH the host and the guest emit
+        // before-input-event for the same physical press — dedupe so each
+        // chord is forwarded exactly once.
+        const now = Date.now();
+        if (cmd === lastChord.cmd && (now - lastChord.at) < 60) return;
+        lastChord = { cmd, at: now };
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('global-shortcut', cmd);
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+
 app.whenReady().then(() => {
     hardenSession(session.defaultSession);
     
@@ -71,6 +107,9 @@ app.whenReady().then(() => {
     });
 
     mainWindow.loadFile('index.html');
+
+    // Chrome shortcuts must work even when a webview guest has keyboard focus
+    mainWindow.webContents.on('before-input-event', handleGlobalShortcut);
 
     // System Tray Integration
     try {
@@ -101,32 +140,104 @@ ipcMain.on('window-maximize', () => {
 });
 ipcMain.on('window-close', () => mainWindow && mainWindow.close());
 
-// Config lookup
-ipcMain.handle('get-config', () => {
-    const paths = [
-        path.join(os.homedir(), 'newapp', 'config.json'),
-        path.join(os.homedir(), '.my_webapp_data', 'config.json'),
-        path.join(__dirname, '..', 'config.json')
+// Config lookup — read and write MUST resolve to the same file, otherwise
+// settings saved at runtime are silently written to a location never read again.
+function resolveConfigPath() {
+    const candidates = [
+        path.join(__dirname, 'config.json'),                                   // dev / repo checkout
+        path.join(os.homedir(), 'newapp', 'config.json'),                      // legacy location
+        path.join(os.homedir(), '.my_webapp_data', 'config.json'),             // legacy location
+        path.join(app.getPath('userData'), 'config.json')                      // packaged installs
     ];
-    for (const configPath of paths) {
+    for (const configPath of candidates) {
+        try { if (fs.existsSync(configPath)) return configPath; } catch (e) {}
+    }
+    return candidates[candidates.length - 1];
+}
+
+ipcMain.handle('get-config', () => {
+    try {
+        const configPath = resolveConfigPath();
         if (fs.existsSync(configPath)) {
             return JSON.parse(fs.readFileSync(configPath, 'utf8'));
         }
+    } catch (e) {
+        console.error('Config read failed:', e);
     }
     return {};
 });
 
 ipcMain.on('save-config', (event, newConfig) => {
-    const configPath = path.join(os.homedir(), 'newapp', 'config.json');
-    fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 4));
+    try {
+        const configPath = resolveConfigPath();
+        fs.mkdirSync(path.dirname(configPath), { recursive: true });
+        fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 4));
+    } catch (e) {
+        console.error('Config write failed:', e);
+    }
 });
 
 ipcMain.handle('get-preload-path', () => {
     return 'file://' + path.join(__dirname, 'webview-preload.js');
 });
 
+// --- Local Favicon Cache -----------------------------------------------------
+// Fetches service icons once, caches them as data URLs in userData so the
+// sidebar never leaks browsing habits to third-party icon services (Google).
+const FAVICON_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+const faviconCachePath = () => path.join(app.getPath('userData'), 'favicon-cache.json');
+let faviconCache = null;
+
+function loadFaviconCache() {
+    if (!faviconCache) {
+        try { faviconCache = JSON.parse(fs.readFileSync(faviconCachePath(), 'utf8')); }
+        catch (e) { faviconCache = {}; }
+    }
+    return faviconCache;
+}
+
+function persistFaviconCache() {
+    try { fs.writeFileSync(faviconCachePath(), JSON.stringify(faviconCache)); } catch (e) {}
+}
+
+ipcMain.handle('get-favicon', async (event, domain) => {
+    if (!domain || typeof domain !== 'string' || !/^[a-z0-9.-]+$/i.test(domain)) return null;
+
+    const cache = loadFaviconCache();
+    const entry = cache[domain];
+    if (entry && entry.data && entry.ts && (Date.now() - entry.ts) < FAVICON_TTL) {
+        return entry.data;
+    }
+
+    const candidates = [
+        `https://${domain}/favicon.ico`,
+        `https://icons.duckduckgo.com/ip3/${domain}.ico`
+    ];
+
+    for (const url of candidates) {
+        try {
+            const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(5000) });
+            if (!res.ok) continue;
+            const type = (res.headers.get('content-type') || '').split(';')[0].trim();
+            if (!type.startsWith('image/')) continue;
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (buf.length === 0 || buf.length > 200 * 1024) continue;
+
+            const dataUrl = `data:${type};base64,${buf.toString('base64')}`;
+            cache[domain] = { data: dataUrl, ts: Date.now() };
+            persistFaviconCache();
+            return dataUrl;
+        } catch (e) { /* try next candidate */ }
+    }
+    return null;
+});
+// -----------------------------------------------------------------------------
+
 ipcMain.on('update-badge', (event, count) => {
     if (app.setBadgeCount) app.setBadgeCount(count);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setTitle(count > 0 ? `WebSpace (${count})` : 'WebSpace');
+    }
     if (tray) tray.setToolTip(count > 0 ? `WebSpace (${count} unread)` : 'WebSpace');
 });
 
@@ -149,20 +260,50 @@ ipcMain.on('show-notification', (event, { title, body, appName }) => {
     }
 });
 
+// Permissions are remembered per-session so users aren't spammed with dialogs
+const permissionMemory = new Map();
+const PERM_LABELS = {
+    media: 'camera & microphone',
+    'display-capture': 'your screen',
+    geolocation: 'your location',
+    notifications: 'desktop notifications',
+    clipboard_read: 'read your clipboard',
+    'clipboard-read': 'read your clipboard',
+    midi: 'MIDI devices',
+    midiSysex: 'MIDI devices',
+    idleDetection: 'idle detection'
+};
+// Low-risk permissions granted without prompting
+const PERM_AUTO_ALLOW = new Set(['fullscreen', 'pointerLock', 'clipboard-sanitized-write', 'idle-detection']);
+
 ipcMain.on('setup-partition', (event, partitionName) => {
     const ses = session.fromPartition(partitionName);
-    
-    // Clear cache periodic protection
+
     ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
-        let urlHost = "unknown";
+        let urlHost = 'unknown';
         try { urlHost = new URL(details.requestingUrl).host; } catch (e) {}
-        const choice = dialog.showMessageBoxSync(mainWindow, {
+
+        if (PERM_AUTO_ALLOW.has(permission)) return callback(true);
+
+        const memKey = `${urlHost}:${permission}`;
+        if (permissionMemory.has(memKey)) return callback(permissionMemory.get(memKey));
+
+        const label = PERM_LABELS[permission] || permission;
+        dialog.showMessageBox(mainWindow, {
             type: 'question',
             buttons: ['Allow', 'Deny'],
+            defaultId: 0,
+            cancelId: 1,
+            noLink: true,
             title: 'Permission Request',
-            message: `The website '${urlHost}' wants to access your ${permission}.\n\nDo you want to allow this?`
-        });
-        callback(choice === 0);
+            message: `The website '${urlHost}' wants to access ${label}.`,
+            detail: 'You can remember this choice for the current session.',
+            checkboxLabel: 'Remember this choice for this session'
+        }).then(({ response, checkboxChecked }) => {
+            const allowed = response === 0;
+            if (checkboxChecked) permissionMemory.set(memKey, allowed);
+            callback(allowed);
+        }).catch(() => callback(false));
     });
 
     // Actively reject native WebAuthn/FIDO2 prompts so they don't hang the UI and force Microsoft to fallback.
@@ -173,6 +314,11 @@ ipcMain.on('setup-partition', (event, partitionName) => {
 });
 
 app.on('web-contents-created', (event, contents) => {
+    // Webview guests get their own input stream — hook them up too
+    if (contents.getType() === 'webview') {
+        contents.on('before-input-event', handleGlobalShortcut);
+    }
+
     contents.setWindowOpenHandler(({ url }) => {
         // Allow all popups to open as new windows natively.
         // We MUST inject the preload script into the popup so that Microsoft
