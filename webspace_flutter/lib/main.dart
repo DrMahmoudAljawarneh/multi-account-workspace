@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -83,6 +84,14 @@ void main() async {
     }
     await windowManager.focus();
     try {
+      // window_manager resolves this against
+      // <exe_dir>/data/flutter_assets, which is correct both for the
+      // installed bundle (/opt/webspace) and the dist/ dev bundle.
+      // (Passing an absolute path here would break it: the plugin joins
+      // the two, producing a nonexistent path.)
+      final iconFile = File(
+          '${File(Platform.resolvedExecutable).parent.path}/data/flutter_assets/assets/icon.png');
+      debugPrint('Window icon asset exists: ${await iconFile.exists()}');
       await windowManager.setIcon('assets/icon.png');
     } catch (e) {
       debugPrint('Error setting icon: $e');
