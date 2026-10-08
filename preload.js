@@ -17,7 +17,14 @@ contextBridge.exposeInMainWorld('api', {
     // Local cached favicon lookup (no third-party tracking)
     getFavicon: (domain) => ipcRenderer.invoke('get-favicon', domain),
 
+    // App UI settings (theme / accent / hibernation)
+    getSettings: () => ipcRenderer.invoke('get-settings'),
+    saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+    writeClipboard: (text) => ipcRenderer.invoke('clipboard-write', text),
+
     // Credential Vault
     saveCredential: (data) => ipcRenderer.invoke('save-credential', data),
-    getCredential: (appName) => ipcRenderer.invoke('get-credential', appName)
+    getCredential: (appName) => ipcRenderer.invoke('get-credential', appName),
+    listCredentials: () => ipcRenderer.invoke('list-credentials'),
+    deleteCredential: (appName) => ipcRenderer.invoke('delete-credential', appName)
 });

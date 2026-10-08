@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, dialog, shell, Tray, Menu, nativeImage, Notification, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, session, dialog, shell, Tray, Menu, nativeImage, Notification, safeStorage, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -341,6 +341,33 @@ app.on('web-contents-created', (event, contents) => {
     });
 });
 
+// --- App UI Settings (theme / accent / hibernation) ---
+const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
+const DEFAULT_UI_SETTINGS = { theme: 'dark', accent: '#0078D7', hibernateMinutes: 20 };
+
+ipcMain.handle('get-settings', () => {
+    try {
+        if (fs.existsSync(settingsPath())) {
+            return { ...DEFAULT_UI_SETTINGS, ...JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) };
+        }
+    } catch (e) { console.error('Settings read failed:', e); }
+    return { ...DEFAULT_UI_SETTINGS };
+});
+
+ipcMain.handle('save-settings', (event, settings) => {
+    try {
+        fs.writeFileSync(settingsPath(), JSON.stringify({ ...DEFAULT_UI_SETTINGS, ...settings }, null, 2));
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('clipboard-write', (event, text) => {
+    try { clipboard.writeText(String(text)); return { success: true }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
 // --- Credential Vault Handlers ---
 const getCredentialsPath = () => path.join(app.getPath('userData'), 'vault.json');
 
@@ -381,6 +408,31 @@ ipcMain.handle('get-credential', async (event, appName) => {
         return { username: vault[appName].username, password: decryptedPassword };
     } catch (e) {
         return null; // Silent fail on decryption errors
+    }
+});
+
+// List stored entries (passwords stay hidden until explicitly revealed/copied)
+ipcMain.handle('list-credentials', () => {
+    try {
+        const vaultPath = getCredentialsPath();
+        if (!fs.existsSync(vaultPath)) return [];
+        const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+        return Object.entries(vault).map(([appName, v]) => ({ appName, username: v.username || '' }));
+    } catch (e) {
+        return [];
+    }
+});
+
+ipcMain.handle('delete-credential', (event, appName) => {
+    try {
+        const vaultPath = getCredentialsPath();
+        if (!fs.existsSync(vaultPath)) return { success: true };
+        const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
+        delete vault[appName];
+        fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: e.message };
     }
 });
 // ---------------------------------
