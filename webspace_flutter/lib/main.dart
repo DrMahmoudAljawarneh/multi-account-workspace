@@ -2,16 +2,22 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:tray_manager/legacy.dart';
+// Native tray API (the 0.5.x `legacy.dart` wrappers are deprecated).
+// Imported with a prefix to keep nativeapi's `Image` from clashing with
+// Flutter's Image widget.
+import 'package:tray_manager/tray_manager.dart' as nativeapi;
 import 'package:local_notifier/local_notifier.dart';
 import 'core/app_settings.dart';
 import 'core/providers.dart';
 import 'core/config_manager.dart';
-import 'features/settings/settings_dialog.dart';
+import 'core/session_store.dart';
+import 'core/viewport.dart';
+import 'features/find/find_bar.dart';
+import 'features/palette/command_palette.dart';
+import 'features/sidebar/sidebar_panel.dart';
+import 'features/titlebar/app_titlebar.dart';
 import 'features/toolbar/app_toolbar.dart';
-import 'features/vault/vault_dialog.dart';
 import 'features/webview/webview_container.dart';
-import 'features/widgets/favicon_icon.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,25 +25,14 @@ void main() async {
   // Load profiles from config.json + shared UI settings
   initialProfiles = await ConfigManager.loadProfiles();
   initialSettings = SettingsStore.load();
+
+  // Restore last session (active app, split, sidebar, URLs, zoom, mute),
+  // healing any ids that no longer exist in the profile list.
+  initialSession =
+      SessionStore.load().validate(initialProfiles.map((p) => p.id).toSet());
   
-  // Initialize tray manager
-  await trayManager.setIcon(
-    'assets/icon.png',
-  );
-  Menu menu = Menu(
-    items: [
-      MenuItem(
-        key: 'show_window',
-        label: 'Show WebSpace',
-      ),
-      MenuItem.separator(),
-      MenuItem(
-        key: 'exit_app',
-        label: 'Exit',
-      ),
-    ],
-  );
-  await trayManager.setContextMenu(menu);
+  // Initialize the tray icon through tray_manager's native API
+  await _initTray();
   
   // Initialize local notifier
   await localNotifier.setup(
@@ -100,6 +95,57 @@ Color _accentFromHex(String hex) {
   }
 }
 
+// Tray icon/menu handles are captured by their event-listener closures for
+// the lifetime of the process.
+Future<void> _initTray() async {
+  try {
+    final tray = nativeapi.TrayIcon.create();
+    if (tray == null) return;
+    final icon = nativeapi.ImageAsset.fromAsset('assets/icon.png') ??
+        nativeapi.Image.fromFile('assets/icon.png');
+    tray
+      ..icon = icon
+      ..isIconTemplate = false
+      ..iconSize = const Size.square(18)
+      ..setTooltip('WebSpace')
+      ..setVisible(true);
+
+    final menu = nativeapi.Menu.create();
+    final showItem = nativeapi.MenuItem.createWithLabelAndType(
+        'Show WebSpace', nativeapi.MenuItemType.normal);
+    final exitItem = nativeapi.MenuItem.createWithLabelAndType(
+        'Exit', nativeapi.MenuItemType.normal);
+    menu?.addItem(showItem);
+    menu?.addItem(nativeapi.MenuItem.createWithLabelAndType(
+        '', nativeapi.MenuItemType.separator));
+    menu?.addItem(exitItem);
+    tray.setContextMenu(menu);
+
+    // Left-click on the tray icon → show the window
+    tray.addListener((event) {
+      if (event is nativeapi.TrayIconClickedEvent) {
+        windowManager.show();
+        windowManager.focus();
+      }
+    });
+
+    // Context-menu item clicks (per-item listeners, like the legacy wiring)
+    showItem?.addListener((event) {
+      if (event is nativeapi.MenuItemClickedEvent) {
+        windowManager.show();
+        windowManager.focus();
+      }
+    });
+    exitItem?.addListener((event) {
+      if (event is nativeapi.MenuItemClickedEvent) {
+        windowManager.destroy();
+      }
+    });
+  } catch (e) {
+    debugPrint('Tray unavailable: $e');
+  }
+}
+
 class WebSpaceApp extends ConsumerWidget {
   const WebSpaceApp({super.key});
 
@@ -130,19 +176,17 @@ class WorkspaceScreen extends ConsumerStatefulWidget {
   ConsumerState<WorkspaceScreen> createState() => _WorkspaceScreenState();
 }
 
-class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowListener, TrayListener {
+class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowListener {
   @override
   void initState() {
     super.initState();
     windowManager.addListener(this);
-    trayManager.addListener(this);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
   }
 
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
-    trayManager.removeListener(this);
     windowManager.removeListener(this);
     super.dispose();
   }
@@ -152,22 +196,6 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
     bool isPreventClose = await windowManager.isPreventClose();
     if (isPreventClose) {
       windowManager.hide();
-    }
-  }
-
-  @override
-  void onTrayIconMouseDown() {
-    windowManager.show();
-    windowManager.focus();
-  }
-  
-  @override
-  void onTrayMenuItemClick(MenuItem menuItem) {
-    if (menuItem.key == 'show_window') {
-      windowManager.show();
-      windowManager.focus();
-    } else if (menuItem.key == 'exit_app') {
-      windowManager.destroy();
     }
   }
 
@@ -184,17 +212,63 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
         final splitEnabled = ref.read(isSplitViewEnabledProvider);
         if (!splitEnabled) {
           final profiles = ref.read(profilesProvider);
-          final current = ref.read(activeProfileIndexProvider);
-          ref.read(activeProfileIndex2Provider.notifier).setIndex((current + 1) % profiles.length);
+          if (profiles.isNotEmpty) {
+            final current =
+                indexForId(profiles, ref.read(activeProfileIdProvider));
+            ref.read(activeProfileId2Provider.notifier).select(
+                profiles[(current + 1) % profiles.length].id);
+          }
         }
         ref.read(isSplitViewEnabledProvider.notifier).toggle();
+        return true;
+      } else if (event.logicalKey == LogicalKeyboardKey.keyF &&
+          !HardwareKeyboard.instance.isShiftPressed) {
+        ref.read(isFindOpenProvider.notifier).toggle();
+        return true;
+      } else if (event.logicalKey == LogicalKeyboardKey.keyM &&
+          HardwareKeyboard.instance.isShiftPressed) {
+        final id = ref.read(activeProfileIdProvider);
+        if (id != null) {
+          ViewportCommands.toggleMute(ref, id).then((_) {
+            if (!mounted) return;
+            final muted =
+                ref.read(mutedAppsProvider.notifier).isMuted(id);
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(muted ? 'Audio muted' : 'Audio unmuted'),
+              duration: const Duration(seconds: 1),
+            ));
+          });
+        }
+        return true;
+      } else if (event.logicalKey == LogicalKeyboardKey.equal ||
+          event.logicalKey == LogicalKeyboardKey.minus ||
+          event.logicalKey == LogicalKeyboardKey.digit0) {
+        final id = ref.read(activeProfileIdProvider);
+        if (id != null) {
+          final key = event.logicalKey;
+          final Future<double> result;
+          if (key == LogicalKeyboardKey.minus) {
+            result = ViewportCommands.zoomOut(ref, id);
+          } else if (key == LogicalKeyboardKey.digit0) {
+            result = ViewportCommands.zoomReset(ref, id);
+          } else {
+            result = ViewportCommands.zoomIn(ref, id);
+          }
+          result.then((next) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('${(next * 100).round()}%'),
+              duration: const Duration(seconds: 1),
+            ));
+          });
+        }
         return true;
       } else if (event.logicalKey.keyId >= LogicalKeyboardKey.digit1.keyId && 
                  event.logicalKey.keyId <= LogicalKeyboardKey.digit9.keyId) {
         int index = event.logicalKey.keyId - LogicalKeyboardKey.digit1.keyId;
         final profiles = ref.read(profilesProvider);
         if (index < profiles.length) {
-          ref.read(activeProfileIndexProvider.notifier).setIndex(index);
+          ref.read(activeProfileIdProvider.notifier).select(profiles[index].id);
         }
         return true;
       }
@@ -202,188 +276,38 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
     return false;
   }
 
-  void _showCommandPalette() {
-    debugPrint('DEBUG: _showCommandPalette() called');
-    final appContext = context; // workspace context (dialog context dies on pop)
-    String searchQuery = '';
-    VoidCallback? pendingAction;
-    showDialog(
-      context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            final profiles = ref.read(profilesProvider);
-            final query = searchQuery.toLowerCase();
-
-            final actions = <({
-              String title,
-              String subtitle,
-              IconData icon,
-              VoidCallback run,
-            })>[
-              (
-                title: 'Settings…',
-                subtitle: 'Appearance, profiles & apps, advanced JSON',
-                icon: Icons.settings_outlined,
-                run: () => showDialog(
-                    context: appContext, builder: (_) => const SettingsDialog()),
-              ),
-              (
-                title: 'Credential vault…',
-                subtitle: 'Reveal, copy or update stored passwords',
-                icon: Icons.key_outlined,
-                run: () => showDialog(
-                    context: appContext, builder: (_) => const VaultDialog()),
-              ),
-              (
-                title: 'Toggle light / dark theme',
-                subtitle: 'Switch appearance instantly',
-                icon: Icons.brightness_6_outlined,
-                run: () {
-                  final s = ref.read(settingsProvider);
-                  ref.read(settingsProvider.notifier).update(
-                      s.copyWith(theme: s.theme == 'light' ? 'dark' : 'light'));
-                },
-              ),
-            ];
-            final filteredActions = actions
-                .where((a) =>
-                    a.title.toLowerCase().contains(query) ||
-                    a.subtitle.toLowerCase().contains(query))
-                .toList();
-            final filteredProfiles = profiles
-                .where((p) => p.name.toLowerCase().contains(query))
-                .toList();
-
-            return Dialog(
-              backgroundColor: Colors.transparent,
-              elevation: 0,
-              child: Material(
-                color: Theme.of(context).colorScheme.surface,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  side: BorderSide(
-                      color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.15),
-                      width: 1),
-                ),
-                elevation: 20,
-                shadowColor: Colors.black,
-                child: Container(
-                  width: 500,
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      autofocus: true,
-                      style: const TextStyle(fontSize: 18),
-                      decoration: InputDecoration(
-                        hintText: 'Search commands or profiles...',
-                        prefixIcon: const Icon(Icons.search),
-                        filled: true,
-                        fillColor: Colors.black12,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide.none,
-                        ),
-                      ),
-                      onChanged: (value) {
-                        setDialogState(() {
-                          searchQuery = value;
-                        });
-                      },
-                      onSubmitted: (value) {
-                        if (filteredActions.isNotEmpty) {
-                          pendingAction = filteredActions.first.run;
-                        } else if (filteredProfiles.isNotEmpty) {
-                          final index = profiles.indexOf(filteredProfiles.first);
-                          ref.read(activeProfileIndexProvider.notifier).setIndex(index);
-                        }
-                        Navigator.of(context).pop();
-                      },
-                    ),
-                    const SizedBox(height: 16),
-                    if (filteredProfiles.isEmpty && filteredActions.isEmpty)
-                      const Text('No profiles found', style: TextStyle(color: Colors.grey))
-                    else
-                      Flexible(
-                        child: ListView.builder(
-                          shrinkWrap: true,
-                          itemCount:
-                              filteredActions.length + filteredProfiles.length,
-                          itemBuilder: (context, index) {
-                            if (index < filteredActions.length) {
-                              final action = filteredActions[index];
-                              return Material(
-                                color: Colors.transparent,
-                                child: ListTile(
-                                  leading: Icon(action.icon),
-                                  title: Text(action.title),
-                                  subtitle: Text(action.subtitle,
-                                      style: const TextStyle(fontSize: 12)),
-                                  onTap: () {
-                                    pendingAction = action.run;
-                                    Navigator.of(context).pop();
-                                  },
-                                ),
-                              );
-                            }
-                            final profile =
-                                filteredProfiles[index - filteredActions.length];
-                            return Material(
-                              color: Colors.transparent,
-                              child: ListTile(
-                                leading: const Icon(Icons.web),
-                                title: Text(profile.name),
-                                subtitle: Text(profile.initialUrl),
-                                onTap: () {
-                                  final pIndex = profiles.indexOf(profile);
-                                  ref.read(activeProfileIndexProvider.notifier).setIndex(pIndex);
-                                  Navigator.of(context).pop();
-                                },
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                  ],
-                ),
-                ),
-              ),
-            );
-          }
-        );
-      },
-    ).then((_) {
-      debugPrint('DEBUG: Command Palette closed, resetting state to false');
-      ref.read(isCommandPaletteOpenProvider.notifier).setOpen(false);
-      final action = pendingAction;
-      pendingAction = null;
-      if (action != null) action();
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     ref.listen(isCommandPaletteOpenProvider, (previous, next) {
       debugPrint('DEBUG: isCommandPaletteOpenProvider changed: prev=$previous, next=$next');
       if (next && !(previous ?? false)) {
-        debugPrint('DEBUG: triggering _showCommandPalette()');
-        _showCommandPalette();
+        showCommandPalette(context, ref);
       }
     });
 
+    // Session persistence — mirror selection/UI state to session.flutter.json
+    ref.listen(activeProfileIdProvider, (_, next) =>
+        SessionStore.patch({'activeAppId': next}));
+    ref.listen(activeProfileId2Provider, (_, next) =>
+        SessionStore.patch({'activeAppId2': next}));
+    ref.listen(isSplitViewEnabledProvider, (_, next) =>
+        SessionStore.patch({'splitView': next}));
+    ref.listen(isSidebarCollapsedProvider, (_, next) =>
+        SessionStore.patch({'sidebarCollapsed': next}));
+    ref.listen(isSidebarExpandedProvider, (_, next) =>
+        SessionStore.patch({'sidebarExpanded': next}));
+
     final profiles = ref.watch(profilesProvider);
-    final selectedIndex = ref.watch(activeProfileIndexProvider);
-    final unreadCounts = ref.watch(unreadCountsProvider);
+    final activeId = ref.watch(activeProfileIdProvider);
+    final activeId2 = ref.watch(activeProfileId2Provider);
+    final selectedIndex = indexForId(profiles, activeId);
     final isSidebarCollapsed = ref.watch(isSidebarCollapsedProvider);
-    final isSidebarExpanded = ref.watch(isSidebarExpandedProvider);
     final isSplitView = ref.watch(isSplitViewEnabledProvider);
     final splitPosition = ref.watch(splitDividerPositionProvider);
-    final selectedIndex2 = ref.watch(activeProfileIndex2Provider);
+    final isFindOpen = ref.watch(isFindOpenProvider);
+    final selectedIndex2 =
+        activeId2 == null ? null : indexForId(profiles, activeId2);
     final scheme = Theme.of(context).colorScheme;
-    final sidebarColor =
-        Color.lerp(scheme.surface, Colors.black, 0.12) ?? scheme.surface;
 
     // Mirror Electron's taskbar unread indicator in the window title
     ref.listen(unreadCountsProvider, (previous, next) {
@@ -392,306 +316,30 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
       windowManager.setTitle(total > 0 ? 'WebSpace ($total)' : 'WebSpace');
     });
 
-    // Sidebar layout: group headers interleaved with profile entries
-    final sidebarRows = <_SidebarRow>[];
-    String? lastGroup;
-    for (var i = 0; i < profiles.length; i++) {
-      final p = profiles[i];
-      if (!p.isBrowser && p.group != null && p.group != lastGroup) {
-        sidebarRows.add(_SidebarRow.header(p.group!));
-        lastGroup = p.group;
-      }
-      sidebarRows.add(_SidebarRow.item(i));
-    }
-
     return Scaffold(
       body: Column(
           children: [
-            // Custom Frameless Window Drag Area
-            DragToMoveArea(
-              child: Container(
-                height: 40,
-                decoration: BoxDecoration(
-                  color: scheme.surface,
-                  border: Border(bottom: BorderSide(color: scheme.onSurface.withValues(alpha: 0.06), width: 1)),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Padding(
-                      padding: EdgeInsets.only(left: 16.0),
-                      child: Text('WebSpace', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2)),
-                    ),
-                    Row(
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.minimize, size: 16),
-                          onPressed: () => windowManager.minimize(),
-                          splashRadius: 16,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.crop_square, size: 16),
-                          onPressed: () async {
-                            if (await windowManager.isMaximized()) {
-                              windowManager.unmaximize();
-                            } else {
-                              windowManager.maximize();
-                            }
-                          },
-                          splashRadius: 16,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.close, size: 16),
-                          onPressed: () => windowManager.close(),
-                          splashRadius: 16,
-                          hoverColor: Colors.red.withValues(alpha: 0.8),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const AppToolbar(),
+            const AppTitlebar(),
+                        const AppToolbar(),
             Expanded(
-              child: Row(
+              child: Stack(
                 children: [
+                  Row(
+                    children: [
                   if (!isSidebarCollapsed)
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      width: isSidebarExpanded ? 220 : 72,
-                      decoration: BoxDecoration(
-                        color: sidebarColor,
-                        border: Border(right: BorderSide(color: scheme.onSurface.withValues(alpha: 0.06), width: 1)),
-                      ),
-                    child: Column(
-                      children: [
-                        const SizedBox(height: 16),
-                        Expanded(
-                          child: ListView.builder(
-                            itemCount: sidebarRows.length,
-                            itemBuilder: (context, rowIdx) {
-                              final row = sidebarRows[rowIdx];
-                              if (row.isHeader) {
-                                if (isSidebarExpanded) {
-                                  return Padding(
-                                    padding:
-                                        const EdgeInsets.fromLTRB(20, 18, 12, 4),
-                                    child: Text(
-                                      row.label!.toUpperCase(),
-                                      style: TextStyle(
-                                        fontSize: 10.5,
-                                        fontWeight: FontWeight.w700,
-                                        letterSpacing: 1.2,
-                                        color: scheme.onSurfaceVariant,
-                                      ),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  );
-                                }
-                                // Collapsed sidebar: subtle divider instead
-                                return Padding(
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 8),
-                                  child: Center(
-                                    child: Container(
-                                      width: 24,
-                                      height: 1,
-                                      color: scheme.onSurface.withValues(alpha: 0.15),
-                                    ),
-                                  ),
-                                );
-                              }
-
-                              final index = row.index;
-                              final profile = profiles[index];
-                              final isSelected = index == selectedIndex;
-                              final unread = unreadCounts[profile.id] ?? 0;
-                              return GestureDetector(
-                                onTap: () => ref.read(activeProfileIndexProvider.notifier).setIndex(index),
-                                child: Container(
-                                  margin: const EdgeInsets.symmetric(vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      // Active edge indicator
-                                      AnimatedContainer(
-                                        duration: const Duration(milliseconds: 200),
-                                        width: 4,
-                                        height: isSelected ? 32 : 12,
-                                        decoration: BoxDecoration(
-                                          color: isSelected 
-                                            ? Theme.of(context).colorScheme.primary
-                                            : Colors.transparent,
-                                          borderRadius: const BorderRadius.only(
-                                            topRight: Radius.circular(4),
-                                            bottomRight: Radius.circular(4),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                      // Franz/Discord style shape-shifting icon with badge
-                                      Tooltip(
-                                        message: profile.name,
-                                        preferBelow: false,
-                                        verticalOffset: 24,
-                                        child: Stack(
-                                          clipBehavior: Clip.none,
-                                          children: [
-                                            AnimatedContainer(
-                                              duration: const Duration(milliseconds: 200),
-                                              width: 48,
-                                              height: 48,
-                                              decoration: BoxDecoration(
-                                                color: isSelected 
-                                                    ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.15)
-                                                    : scheme.onSurface.withValues(alpha: 0.08),
-                                                borderRadius: BorderRadius.circular(isSelected ? 16 : 24),
-                                                border: Border.all(
-                                                  color: isSelected 
-                                                      ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.5) 
-                                                      : Colors.transparent,
-                                                  width: 1,
-                                                ),
-                                                boxShadow: isSelected ? [
-                                                  BoxShadow(
-                                                    color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.2),
-                                                    blurRadius: 8,
-                                                    spreadRadius: 1,
-                                                  )
-                                                ] : null,
-                                              ),
-                                              alignment: Alignment.center,
-                                              child: ClipRRect(
-                                                borderRadius: BorderRadius.circular(isSelected ? 16 : 24),
-                                                child: FaviconIcon(
-                                                  url: profile.initialUrl,
-                                                  fallbackLetter: profile.name.isEmpty
-                                                      ? '?'
-                                                      : profile.name.substring(0, 1),
-                                                  size: 24,
-                                                  letterColor: isSelected
-                                                      ? Theme.of(context).colorScheme.primary
-                                                      : scheme.onSurfaceVariant,
-                                                ),
-                                              ),
-                                            ),
-                                            if (!isSidebarExpanded && unread > 0)
-                                              Positioned(
-                                                right: -4,
-                                                bottom: -4,
-                                                child: Container(
-                                                  padding: const EdgeInsets.all(4),
-                                                  decoration: BoxDecoration(
-                                                    color: Colors.red,
-                                                    shape: BoxShape.circle,
-                                                    border: Border.all(color: sidebarColor, width: 2),
-                                                    boxShadow: const [
-                                                      BoxShadow(
-                                                        color: Colors.black45,
-                                                        blurRadius: 4,
-                                                        offset: Offset(0, 2),
-                                                      )
-                                                    ],
-                                                  ),
-                                                  child: Text(
-                                                    '$unread',
-                                                    style: const TextStyle(
-                                                      color: Colors.white,
-                                                      fontSize: 10,
-                                                      fontWeight: FontWeight.bold,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                          ],
-                                        ),
-                                      ),
-                                      if (isSidebarExpanded) ...[
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: Text(
-                                            profile.name,
-                                            style: TextStyle(
-                                              color: isSelected
-                                                  ? Theme.of(context).colorScheme.primary
-                                                  : scheme.onSurfaceVariant,
-                                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                                              fontSize: 14,
-                                            ),
-                                            overflow: TextOverflow.ellipsis,
-                                            maxLines: 1,
-                                            softWrap: false,
-                                          ),
-                                        ),
-                                        if (unread > 0)
-                                          Container(
-                                            margin: const EdgeInsets.only(left: 6),
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 7, vertical: 2),
-                                            decoration: BoxDecoration(
-                                              color: Theme.of(context).colorScheme.primary,
-                                              borderRadius: BorderRadius.circular(999),
-                                            ),
-                                            child: Text(
-                                              '$unread',
-                                              style: TextStyle(
-                                                color: Theme.of(context).colorScheme.onPrimary,
-                                                fontSize: 10.5,
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                            ),
-                                          ),
-                                      ],
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                        // Add Button
-                        Container(
-                          margin: const EdgeInsets.only(bottom: 16),
-                          width: 48,
-                          height: 48,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: scheme.onSurface.withValues(alpha: 0.08),
-                          ),
-                          child: IconButton(
-                            icon: Icon(Icons.add, color: scheme.onSurfaceVariant),
-                            onPressed: () {
-                              ref.read(isCommandPaletteOpenProvider.notifier).setOpen(true);
-                            },
-                          ),
-                        ),
-                        // Toggle Expanded Button
-                        IconButton(
-                          icon: Icon(isSidebarExpanded ? Icons.chevron_left : Icons.chevron_right),
-                          color: scheme.onSurfaceVariant,
-                          onPressed: () {
-                            ref.read(isSidebarExpandedProvider.notifier).toggle();
-                          },
-                        ),
-                        const SizedBox(height: 16),
-                      ],
-                    ),
-                  ),
-                  if (!isSidebarCollapsed)
+                    const SidebarPanel(),
+                                    if (!isSidebarCollapsed)
                     VerticalDivider(thickness: 1, width: 1, color: scheme.onSurface.withValues(alpha: 0.1)),
                   Expanded(
                     flex: isSplitView ? (splitPosition * 100).toInt() : 100,
                     child: IndexedStack(
                       index: selectedIndex,
-                      children: profiles.asMap().entries.map((entry) {
-                        final index = entry.key;
-                        final profile = entry.value;
+                      children: profiles.map((profile) {
                         return WebviewContainer(
                           key: ValueKey('main_${profile.id}'),
                           profileId: profile.id,
                           initialUrl: profile.initialUrl,
                           profileName: profile.name,
-                          profileIndex: index,
                           customCSS: profile.customCSS,
                           isBrowser: profile.isBrowser,
                         );
@@ -715,15 +363,12 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
                       flex: ((1 - splitPosition) * 100).toInt(),
                       child: IndexedStack(
                         index: selectedIndex2,
-                        children: profiles.asMap().entries.map((entry) {
-                          final index = entry.key;
-                          final profile = entry.value;
+                        children: profiles.map((profile) {
                           return WebviewContainer(
                             key: ValueKey('split_${profile.id}'),
                             profileId: profile.id,
                             initialUrl: profile.initialUrl,
                             profileName: profile.name,
-                            profileIndex: index,
                             customCSS: profile.customCSS,
                             isBrowser: profile.isBrowser,
                             pane: 'split',
@@ -732,25 +377,18 @@ class _WorkspaceScreenState extends ConsumerState<WorkspaceScreen> with WindowLi
                       ),
                     ),
                 ],
+                  ),
+                  if (isFindOpen)
+                    const Positioned(
+                      top: 10,
+                      right: 16,
+                      child: FindBar(),
+                    ),
+                ],
               ),
             ),
           ],
         ),
       );
   }
-}
-
-/// One sidebar row: either a group header label or a profile entry index.
-class _SidebarRow {
-  final bool isHeader;
-  final String? label;
-  final int index;
-
-  const _SidebarRow.header(this.label)
-      : isHeader = true,
-        index = -1;
-
-  const _SidebarRow.item(this.index)
-      : isHeader = false,
-        label = null;
 }

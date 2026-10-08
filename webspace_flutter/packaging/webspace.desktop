@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=WebSpace
+Comment=Grouped web-app dashboard with split view and credential vault
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+StartupWMClass=com.webspace.app

@@ -2,15 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:webview_all/webview_all.dart';
 
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:local_notifier/local_notifier.dart';
 import '../../core/providers.dart';
+import '../../core/session_store.dart';
+import '../../core/vault_service.dart';
+import '../../core/viewport.dart';
 
 class WebviewContainer extends ConsumerStatefulWidget {
   final String profileId;
   final String initialUrl;
   final String profileName;
-  final int profileIndex;
   final String? customCSS;
   final bool isBrowser;
   final String pane; // 'main' or 'split' — registry key for toolbar control
@@ -20,7 +23,6 @@ class WebviewContainer extends ConsumerStatefulWidget {
     required this.profileId,
     required this.initialUrl,
     required this.profileName,
-    required this.profileIndex,
     this.customCSS,
     this.isBrowser = false,
     this.pane = 'main',
@@ -42,12 +44,17 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
 
   String get _registryKey => '${widget.pane}_${widget.profileId}';
 
+  /// True when this profile is the active app in either pane (by stable id).
+  bool get _isActive {
+    final activeId = ref.read(activeProfileIdProvider);
+    final activeId2 = ref.read(activeProfileId2Provider);
+    return activeId == widget.profileId || activeId2 == widget.profileId;
+  }
+
   @override
   void initState() {
     super.initState();
-    final activeIndex = ref.read(activeProfileIndexProvider);
-    final activeIndex2 = ref.read(activeProfileIndex2Provider);
-    if (activeIndex == widget.profileIndex || activeIndex2 == widget.profileIndex) {
+    if (_isActive) {
       _hasBeenInitialized = true;
       _initializeWebview();
     }
@@ -87,6 +94,30 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
               subtitle: widget.profileName,
             );
             notification.show();
+          } else if (message.message == 'openFind') {
+            ref.read(isFindOpenProvider.notifier).setOpen(true);
+          } else if (message.message == 'zoomIn') {
+            _adjustZoom(0.1);
+          } else if (message.message == 'zoomOut') {
+            _adjustZoom(-0.1);
+          } else if (message.message == 'zoomReset') {
+            _adjustZoom(null);
+          } else if (message.message == 'toggleMute') {
+            ViewportCommands.toggleMute(ref, widget.profileId);
+          } else if (message.message == 'toggleSidebar') {
+            ref.read(isSidebarCollapsedProvider.notifier).toggle();
+          } else if (message.message == 'toggleSplit') {
+            _toggleSplit();
+          } else if (message.message.startsWith('goto:')) {
+            final idx = int.tryParse(message.message.substring(5)) ?? -1;
+            final profiles = ref.read(profilesProvider);
+            if (idx >= 0 && idx < profiles.length) {
+              ref
+                  .read(activeProfileIdProvider.notifier)
+                  .select(profiles[idx].id);
+            }
+          } else if (message.message == 'autofill:need') {
+            _tryAutofill();
           }
         },
       )
@@ -130,6 +161,9 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
                 _urlController.text = url;
               }
             }
+
+            // Remember where this app ended up so a restart restores it
+            SessionStore.setUrl(widget.profileId, url);
             
             // Inject Custom CSS
             final customCss = widget.customCSS;
@@ -144,16 +178,27 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
               ''');
             }
 
-            // Inject script to listen for Ctrl+K since WebViews swallow hardware keys
+            // Inject script to listen for shortcuts since WebViews swallow
+            // hardware keys — mirrors the Flutter-side handlers.
             _controller.runJavaScript('''
               if (!window.shortcutInjected) {
                 document.addEventListener('keydown', function(e) {
-                  if (e.ctrlKey && e.key === 'k') {
-                    e.preventDefault();
+                  if (!e.ctrlKey) return;
+                  var post = function(msg) {
                     if (typeof FlutterCommandPalette !== 'undefined') {
-                      FlutterCommandPalette.postMessage('openCommandPalette');
+                      FlutterCommandPalette.postMessage(msg);
                     }
-                  }
+                  };
+                  var k = e.key;
+                  if (k === 'k') { e.preventDefault(); post('openCommandPalette'); }
+                  else if (k === 'f') { e.preventDefault(); post('openFind'); }
+                  else if (k === '=' || k === '+') { e.preventDefault(); post('zoomIn'); }
+                  else if (k === '-') { e.preventDefault(); post('zoomOut'); }
+                  else if (k === '0') { e.preventDefault(); post('zoomReset'); }
+                  else if (k === 'b' || k === 'B') { e.preventDefault(); post('toggleSidebar'); }
+                  else if (k === 'S' || k === 's') { e.preventDefault(); post('toggleSplit'); }
+                  else if ((k === 'M' || k === 'm') && e.shiftKey) { e.preventDefault(); post('toggleMute'); }
+                  else if (k >= '1' && k <= '9') { e.preventDefault(); post('goto:' + (parseInt(k, 10) - 1)); }
                 });
                 window.shortcutInjected = true;
               }
@@ -192,10 +237,26 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
                 window.notificationsInjected = true;
               }
             ''');
+
+            // Restore this app's persisted zoom / mute on every load
+            ViewportCommands.reapplyOnLoad(ref, widget.profileId, (js) =>
+                _controller.runJavaScript(js));
+
+            // Look for a login form and ask Dart to auto-fill it silently
+            _controller.runJavaScript('''
+              setTimeout(function() {
+                if (document.querySelector('input[type=password]') &&
+                    typeof FlutterCommandPalette !== 'undefined') {
+                  FlutterCommandPalette.postMessage('autofill:need');
+                }
+              }, 600);
+            ''');
           },
         ),
       )
-      ..loadRequest(Uri.parse(widget.initialUrl));
+      // Restore the last visited URL for this app when we have one
+      ..loadRequest(Uri.parse(
+          SessionStore.load().urls[widget.profileId] ?? widget.initialUrl));
 
     // Expose the controller to the toolbar (back / forward / reload).
     // Deferred: initState runs during build, where provider writes throw.
@@ -211,10 +272,70 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
     });
   }
 
+  /// Zoom step from the in-page shortcut bridge (delta null = reset).
+  Future<void> _adjustZoom(double? delta) async {
+    final next = await (delta == null
+        ? ViewportCommands.zoomReset(ref, widget.profileId)
+        : delta > 0
+            ? ViewportCommands.zoomIn(ref, widget.profileId)
+            : ViewportCommands.zoomOut(ref, widget.profileId));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('${(next * 100).round()}%'),
+        duration: const Duration(seconds: 1),
+      ));
+    }
+  }
+
+  /// Ctrl+Shift+S — split toggle shared with the hardware shortcut handler.
+  void _toggleSplit() {
+    final enabled = ref.read(isSplitViewEnabledProvider);
+    if (!enabled) {
+      final profiles = ref.read(profilesProvider);
+      if (profiles.isNotEmpty) {
+        final current =
+            indexForId(profiles, ref.read(activeProfileIdProvider));
+        ref
+            .read(activeProfileId2Provider.notifier)
+            .select(profiles[(current + 1) % profiles.length].id);
+      }
+    }
+    ref.read(isSplitViewEnabledProvider.notifier).toggle();
+  }
+
+  /// Fills a detected login form from the OS keyring when the vault has an
+  /// entry matching this profile's name (silent, once per page load).
+  Future<void> _tryAutofill() async {
+    VaultCredential? cred;
+    try {
+      cred = await VaultService.get(widget.profileName);
+    } catch (_) {
+      return;
+    }
+    if (cred == null || !mounted) return;
+    final user = jsonEncode(cred.username);
+    final pass = jsonEncode(cred.password);
+    try {
+      await _controller.runJavaScript('''
+        (() => {
+          const pw = document.querySelector('input[type=password]:not([readonly]):not([disabled])');
+          if (!pw) return;
+          const form = pw.form || document;
+          const user = form.querySelector('input[type=email],input[type=text],input[name*="user" i],input[name*="login" i],input[name*="email" i]');
+          const set = (el, v) => {
+            el.value = v;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          };
+          if (user && !user.value) set(user, $user);
+          if (!pw.value) set(pw, $pass);
+        })();
+      ''');
+    } catch (_) {}
+  }
+
   void _checkHibernation() {
-    final activeIndex = ref.read(activeProfileIndexProvider);
-    final activeIndex2 = ref.read(activeProfileIndex2Provider);
-    final isActive = activeIndex == widget.profileIndex || activeIndex2 == widget.profileIndex;
+    final isActive = _isActive;
 
     if (!isActive) {
       // Start hibernation timer if not active (timeout from settings; 0 = never)
@@ -254,12 +375,12 @@ class _WebviewContainerState extends ConsumerState<WebviewContainer> {
 
   @override
   Widget build(BuildContext context) {
-    // Listen to active index changes in BOTH panes so split-pane switches
+    // Listen to active selection changes in BOTH panes so split-pane switches
     // also wake / initialize the selected webview.
-    ref.listen(activeProfileIndexProvider, (previous, next) {
+    ref.listen(activeProfileIdProvider, (previous, next) {
       _checkHibernation();
     });
-    ref.listen(activeProfileIndex2Provider, (previous, next) {
+    ref.listen(activeProfileId2Provider, (previous, next) {
       _checkHibernation();
     });
 

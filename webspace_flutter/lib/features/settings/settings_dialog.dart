@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/app_settings.dart';
 import '../../core/config_manager.dart';
 import '../../core/providers.dart';
+import '../widgets/confirm_dialog.dart';
 
 /// Structured settings manager mirroring the Electron build:
 /// Appearance (live theme/accent/hibernation) · Profiles & Apps editor ·
@@ -23,9 +24,9 @@ class _AppDraft {
   final TextEditingController nameCtrl;
   final TextEditingController urlCtrl;
   final TextEditingController cssCtrl;
-  bool showCss;
+  bool showCss = false;
 
-  _AppDraft({required String name, required String url, String css = '', this.showCss = false})
+  _AppDraft({required String name, required String url, String css = ''})
       : nameCtrl = TextEditingController(text: name),
         urlCtrl = TextEditingController(text: url),
         cssCtrl = TextEditingController(text: css);
@@ -64,6 +65,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
   late List<_GroupDraft> _groups;
   late final TextEditingController _jsonCtrl;
   bool _jsonDirty = false;
+  bool _dirty = false; // any unsaved editor / JSON change
   String? _error;
 
   static const _accents = [
@@ -135,6 +137,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
   }
 
   void _draftsChanged() {
+    _dirty = true;
     _jsonDirty = false;
     _jsonCtrl.text = _encodeDrafts(_groups);
     _error = null;
@@ -143,7 +146,10 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
 
   void _draftEdited() {
     // Text changed — keep the user's JSON edits intact but clear old errors
-    if (_error != null) setState(() => _error = null);
+    setState(() {
+      _dirty = true;
+      _error = null;
+    });
   }
 
   // ------------------------------------------------------------ appearance
@@ -223,12 +229,15 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
     final current = ref.read(profilesProvider);
     final browser = current.where((p) => p.isBrowser).toList();
 
-    var id = 1;
+    // Stable ids derived from group + name (same rule as ConfigManager), so
+    // selection, unread badges and session state follow apps across edits.
+    final taken = <String>{'browser_tab', 'fallback'};
     final newProfiles = <AppProfile>[
       for (final g in groups)
         for (final a in g.apps)
           AppProfile(
-            id: (id++).toString(),
+            id: stableProfileId(
+                g.nameCtrl.text.trim(), a.nameCtrl.text.trim(), taken),
             name: a.nameCtrl.text.trim(),
             initialUrl: a.urlCtrl.text.trim(),
             customCSS: a.cssCtrl.text.isEmpty ? null : a.cssCtrl.text,
@@ -237,16 +246,19 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
       ...browser,
     ];
 
+    final activeId = ref.read(activeProfileIdProvider);
+    final activeId2 = ref.read(activeProfileId2Provider);
+
     ref.read(profilesProvider.notifier).setProfiles(newProfiles);
 
-    // Keep pane selections inside the new list bounds
-    final idx = ref.read(activeProfileIndexProvider);
-    if (idx >= newProfiles.length) {
-      ref.read(activeProfileIndexProvider.notifier).setIndex(0);
+    // Preserve the current selections by id; heal them if the app was
+    // removed or renamed in this edit.
+    if (activeId == null || !newProfiles.any((p) => p.id == activeId)) {
+      ref.read(activeProfileIdProvider.notifier).select(
+          newProfiles.isNotEmpty ? newProfiles.first.id : null);
     }
-    final idx2 = ref.read(activeProfileIndex2Provider);
-    if (idx2 != null && idx2 >= newProfiles.length) {
-      ref.read(activeProfileIndex2Provider.notifier).setIndex(0);
+    if (activeId2 != null && !newProfiles.any((p) => p.id == activeId2)) {
+      ref.read(activeProfileId2Provider.notifier).select(null);
     }
 
     try {
@@ -257,6 +269,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
     }
 
     if (mounted) {
+      _dirty = false;
       Navigator.of(context).pop();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -264,6 +277,13 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
           duration: Duration(seconds: 2),
         ),
       );
+    }
+  }
+
+  /// Close button / Cancel — asks before dropping unsaved edits.
+  Future<void> _requestClose() async {
+    if (!_dirty || await confirmDiscardChanges(context)) {
+      if (mounted) Navigator.of(context).pop();
     }
   }
 
@@ -613,7 +633,13 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
-    return Dialog(
+    return PopScope(
+      canPop: !_dirty,
+      onPopInvokedWithResult: (didPop, result) {
+        // Esc / back gesture / barrier tap while dirty → confirm first
+        if (!didPop) _requestClose();
+      },
+      child: Dialog(
       child: SizedBox(
         width: 700,
         height: 580,
@@ -629,7 +655,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
                   IconButton(
                     icon: const Icon(Icons.close, size: 20),
                     splashRadius: 16,
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: _requestClose,
                   ),
                 ],
               ),
@@ -669,7 +695,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
                   else
                     const Spacer(),
                   TextButton(
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: _requestClose,
                     child: const Text('Cancel'),
                   ),
                   const SizedBox(width: 8),
@@ -682,6 +708,7 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog>
             ),
           ],
         ),
+      ),
       ),
     );
   }

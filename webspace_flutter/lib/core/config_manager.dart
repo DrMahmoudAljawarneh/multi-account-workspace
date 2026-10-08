@@ -46,20 +46,24 @@ class ConfigManager {
   }
 
   /// Parses either the Electron grouped-map format or a plain list format.
+  /// Ids are regenerated deterministically from group + name (never read from
+  /// the file) so they are stable across boots, reorders and both builds.
   static List<AppProfile> parseProfiles(String contents) {
     final dynamic decoded = jsonDecode(contents);
     final profiles = <AppProfile>[];
-    var id = 1;
+    final taken = <String>{'browser_tab', 'fallback'};
+    var pos = 0;
 
     if (decoded is List) {
       for (final app in decoded) {
-        profiles.add(_profileFrom(app, group: null, id: id++));
+        profiles.add(_profileFrom(app, group: null, taken: taken, pos: pos++));
       }
     } else if (decoded is Map) {
       decoded.forEach((groupName, apps) {
         if (apps is List) {
           for (final app in apps) {
-            profiles.add(_profileFrom(app, group: groupName as String, id: id++));
+            profiles.add(
+                _profileFrom(app, group: groupName as String, taken: taken, pos: pos++));
           }
         }
       });
@@ -67,12 +71,13 @@ class ConfigManager {
     return profiles;
   }
 
-  static AppProfile _profileFrom(dynamic json, {required String? group, required int id}) {
+  static AppProfile _profileFrom(dynamic json,
+      {required String? group, required Set<String> taken, required int pos}) {
     final map = json is Map ? json : const {};
-    final name = (map['name'] ?? 'App $id').toString();
+    final name = (map['name'] ?? 'App ${pos + 1}').toString();
     final url = (map['url'] ?? map['initialUrl'] ?? 'https://duckduckgo.com').toString();
     return AppProfile(
-      id: (map['id'] ?? id).toString(),
+      id: stableProfileId(group, name, taken),
       name: name,
       initialUrl: url,
       customCSS: map['customCSS'] as String?,

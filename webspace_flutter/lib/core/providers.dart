@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:webview_all/webview_all.dart';
 
 import 'app_settings.dart';
+import 'session_store.dart';
 
 // 1. Data Models
 class AppProfile {
@@ -28,6 +29,32 @@ List<AppProfile> initialProfiles = [];
 // Global initial settings loaded before runApp
 AppSettings initialSettings = AppSettings.defaults;
 
+/// Builds a stable, filesystem/session-safe id from an app's group + name.
+/// Deterministic: the same group/name always yields the same id, so unread
+/// badges, session URLs, zoom and selection survive restarts and reorders.
+/// Collisions (two apps with the same group+name) get a `_2`, `_3` … suffix.
+String stableProfileId(String? group, String name, Set<String> taken) {
+  final base = '${group ?? ''}_$name'
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
+  var id = base.isEmpty ? 'app' : base;
+  var n = 2;
+  while (taken.contains(id)) {
+    id = '${base.isEmpty ? 'app' : base}_$n';
+    n++;
+  }
+  taken.add(id);
+  return id;
+}
+
+/// Resolves a profile id to its list index for IndexedStack; unknown/null ids
+/// fall back to 0 (the first app is always visible).
+int indexForId(List<AppProfile> profiles, String? id) {
+  final i = id == null ? -1 : profiles.indexWhere((p) => p.id == id);
+  return i < 0 ? 0 : i;
+}
+
 // 2. Pre-defined Profiles State
 class ProfilesNotifier extends Notifier<List<AppProfile>> {
   @override
@@ -41,14 +68,17 @@ class ProfilesNotifier extends Notifier<List<AppProfile>> {
 }
 final profilesProvider = NotifierProvider<ProfilesNotifier, List<AppProfile>>(() => ProfilesNotifier());
 
-// 3. Active Profile State
-class ActiveProfileIndexNotifier extends Notifier<int> {
+// 3. Active Profile State — selection is tracked by STABLE PROFILE ID, not
+// list index, so reordering/editing apps can't select the wrong pane.
+class ActiveProfileIdNotifier extends Notifier<String?> {
   @override
-  int build() => 0;
+  String? build() => initialSession.activeAppId;
 
-  void setIndex(int index) => state = index;
+  void select(String? id) => state = id;
 }
-final activeProfileIndexProvider = NotifierProvider<ActiveProfileIndexNotifier, int>(() => ActiveProfileIndexNotifier());
+final activeProfileIdProvider =
+    NotifierProvider<ActiveProfileIdNotifier, String?>(
+        () => ActiveProfileIdNotifier());
 
 // 4. Command Palette State (Controls visibility)
 class CommandPaletteNotifier extends Notifier<bool> {
@@ -73,10 +103,10 @@ class UnreadCountsNotifier extends Notifier<Map<String, int>> {
 }
 final unreadCountsProvider = NotifierProvider<UnreadCountsNotifier, Map<String, int>>(() => UnreadCountsNotifier());
 
-// 6. Sidebar State
+// 6. Sidebar State (seeded from the last session)
 class SidebarCollapseNotifier extends Notifier<bool> {
   @override
-  bool build() => false;
+  bool build() => initialSession.sidebarCollapsed;
 
   void toggle() => state = !state;
 }
@@ -84,28 +114,30 @@ final isSidebarCollapsedProvider = NotifierProvider<SidebarCollapseNotifier, boo
 
 class SidebarExpandedNotifier extends Notifier<bool> {
   @override
-  bool build() => false;
+  bool build() => initialSession.sidebarExpanded;
 
   void toggle() => state = !state;
 }
 final isSidebarExpandedProvider = NotifierProvider<SidebarExpandedNotifier, bool>(() => SidebarExpandedNotifier());
 
-// 7. Split View State
+// 7. Split View State (seeded from the last session)
 class SplitViewNotifier extends Notifier<bool> {
   @override
-  bool build() => false;
+  bool build() => initialSession.splitView;
 
   void toggle() => state = !state;
 }
 final isSplitViewEnabledProvider = NotifierProvider<SplitViewNotifier, bool>(() => SplitViewNotifier());
 
-class ActiveProfileIndex2Notifier extends Notifier<int?> {
+class ActiveProfileId2Notifier extends Notifier<String?> {
   @override
-  int? build() => null;
+  String? build() => initialSession.activeAppId2;
 
-  void setIndex(int? index) => state = index;
+  void select(String? id) => state = id;
 }
-final activeProfileIndex2Provider = NotifierProvider<ActiveProfileIndex2Notifier, int?>(() => ActiveProfileIndex2Notifier());
+final activeProfileId2Provider =
+    NotifierProvider<ActiveProfileId2Notifier, String?>(
+        () => ActiveProfileId2Notifier());
 
 class SplitDividerPositionNotifier extends Notifier<double> {
   @override
@@ -155,3 +187,48 @@ class WebviewControllersNotifier extends Notifier<Map<String, WebViewController>
 final webviewControllersProvider =
     NotifierProvider<WebviewControllersNotifier, Map<String, WebViewController>>(
         () => WebviewControllersNotifier());
+
+// 10. Find-in-page overlay (controls visibility only; query lives in the bar)
+class FindOverlayNotifier extends Notifier<bool> {
+  @override
+  bool build() => false;
+
+  void toggle() => state = !state;
+  void setOpen(bool isOpen) => state = isOpen;
+}
+final isFindOpenProvider =
+    NotifierProvider<FindOverlayNotifier, bool>(() => FindOverlayNotifier());
+
+// 11. Per-app viewport state (persisted to session.flutter.json)
+class ZoomFactorsNotifier extends Notifier<Map<String, double>> {
+  @override
+  Map<String, double> build() => initialSession.zoom;
+
+  double of(String? profileId) => state[profileId] ?? 1.0;
+
+  Future<void> set(String profileId, double factor) async {
+    state = {...state, profileId: factor};
+    await SessionStore.setZoom(profileId, factor);
+  }
+}
+final zoomFactorsProvider =
+    NotifierProvider<ZoomFactorsNotifier, Map<String, double>>(
+        () => ZoomFactorsNotifier());
+
+class MutedAppsNotifier extends Notifier<Map<String, bool>> {
+  @override
+  Map<String, bool> build() => initialSession.muted;
+
+  bool isMuted(String? profileId) => state[profileId] ?? false;
+
+  Future<void> set(String profileId, bool muted) async {
+    state = {...state, profileId: muted};
+    await SessionStore.setMuted(profileId, muted);
+  }
+
+  Future<void> toggle(String profileId) =>
+      set(profileId, !isMuted(profileId));
+}
+final mutedAppsProvider =
+    NotifierProvider<MutedAppsNotifier, Map<String, bool>>(
+        () => MutedAppsNotifier());

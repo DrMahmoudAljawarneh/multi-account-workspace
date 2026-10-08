@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/vault_service.dart';
+import '../widgets/confirm_dialog.dart';
 
 /// Credential vault manager mirroring the Electron build: list / reveal /
 /// copy / delete entries plus an add & edit form, backed by the OS keyring.
@@ -28,11 +29,32 @@ class _VaultDialogState extends State<VaultDialog> {
   bool _obscurePass = true;
   String? _formError;
 
+  // Unsaved-changes guard: the form is dirty when its contents differ from
+  // the snapshot taken when the form was opened / last filled from keyring.
+  bool _restoringForm = false;
+  String _formSnapshot = '';
+
   @override
   void initState() {
     super.initState();
+    _appCtrl.addListener(_formEdited);
+    _userCtrl.addListener(_formEdited);
+    _passCtrl.addListener(_formEdited);
     _reload();
   }
+
+  void _formEdited() {
+    // Skip while we bulk-fill the form; the enclosing setState refreshes us
+    if (!_showForm || _restoringForm || !mounted) return;
+    setState(() {});
+  }
+
+  String get _formText =>
+      '${_appCtrl.text}|${_userCtrl.text}|${_passCtrl.text}';
+
+  bool get _formDirty => _showForm && _formText != _formSnapshot;
+
+  void _captureSnapshot() => _formSnapshot = _formText;
 
   @override
   void dispose() {
@@ -55,18 +77,33 @@ class _VaultDialogState extends State<VaultDialog> {
     setState(() {
       _showForm = true;
       _editingApp = entry?.appName;
+      _restoringForm = true;
       _appCtrl.text = entry?.appName ?? '';
       _userCtrl.text = entry?.username ?? '';
       _passCtrl.text = _passwords[entry?.appName] ?? '';
+      _captureSnapshot();
+      _restoringForm = false;
       _formError = null;
       _obscurePass = true;
     });
     if (entry != null) {
       _ensurePassword(entry.appName).then((_) {
         if (mounted) {
-          setState(() => _passCtrl.text = _passwords[entry.appName] ?? '');
+          setState(() {
+            _restoringForm = true;
+            _passCtrl.text = _passwords[entry.appName] ?? '';
+            _captureSnapshot();
+            _restoringForm = false;
+          });
         }
       });
+    }
+  }
+
+  /// Dialog close (X / Esc / barrier) — confirm while the form has edits.
+  Future<void> _requestClose() async {
+    if (!_formDirty || await confirmDiscardChanges(context)) {
+      if (mounted) Navigator.of(context).pop();
     }
   }
 
@@ -299,7 +336,13 @@ class _VaultDialogState extends State<VaultDialog> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
-    return Dialog(
+    return PopScope(
+      canPop: !_formDirty,
+      onPopInvokedWithResult: (didPop, result) {
+        // Esc / back gesture / barrier tap with form edits → confirm first
+        if (!didPop) _requestClose();
+      },
+      child: Dialog(
       child: SizedBox(
         width: 560,
         height: 520,
@@ -316,7 +359,7 @@ class _VaultDialogState extends State<VaultDialog> {
                   IconButton(
                     icon: const Icon(Icons.close, size: 20),
                     splashRadius: 16,
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: _requestClose,
                   ),
                 ],
               ),
@@ -385,6 +428,7 @@ class _VaultDialogState extends State<VaultDialog> {
             ),
           ],
         ),
+      ),
       ),
     );
   }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers.dart';
+import '../../core/viewport.dart';
 import '../settings/settings_dialog.dart';
 import '../vault/vault_dialog.dart';
 
@@ -13,10 +14,14 @@ class AppToolbar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final selectedIndex = ref.watch(activeProfileIndexProvider);
+    final activeId = ref.watch(activeProfileIdProvider);
     final controllers = ref.watch(webviewControllersProvider);
-    final activeController = controllers['main_$selectedIndex'];
+    final activeController =
+        activeId == null ? null : controllers['main_$activeId'];
     final isSplit = ref.watch(isSplitViewEnabledProvider);
+    final isMuted =
+        ref.watch(mutedAppsProvider.notifier).isMuted(activeId);
+    final isFindOpen = ref.watch(isFindOpenProvider);
     final scheme = Theme.of(context).colorScheme;
     final controller = activeController;
 
@@ -79,15 +84,34 @@ class AppToolbar extends ConsumerWidget {
             onPressed: () {
               if (!isSplit) {
                 final profiles = ref.read(profilesProvider);
-                final current = ref.read(activeProfileIndexProvider);
-                ref
-                    .read(activeProfileIndex2Provider.notifier)
-                    .setIndex((current + 1) % profiles.length);
+                if (profiles.isNotEmpty) {
+                  final current =
+                      indexForId(profiles, ref.read(activeProfileIdProvider));
+                  ref
+                      .read(activeProfileId2Provider.notifier)
+                      .select(profiles[(current + 1) % profiles.length].id);
+                }
               }
               ref.read(isSplitViewEnabledProvider.notifier).toggle();
             },
           ),
           const Spacer(),
+
+          iconButton(
+            icon: Icons.manage_search,
+            tooltip: 'Find in page (Ctrl+F)',
+            active: isFindOpen,
+            onPressed: () =>
+                ref.read(isFindOpenProvider.notifier).toggle(),
+          ),
+          iconButton(
+            icon: isMuted ? Icons.volume_off : Icons.volume_up,
+            tooltip: 'Mute audio (Ctrl+Shift+M)',
+            active: isMuted,
+            onPressed: activeId == null
+                ? null
+                : () => ViewportCommands.toggleMute(ref, activeId),
+          ),
 
           // Ctrl K hint chip (opens the command palette)
           ActionChip(
